@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
+
 ## [0.9.4] - 2026-09-10
 
 ### Fixed

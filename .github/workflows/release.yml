@@ -13,10 +13,10 @@ jobs:
   # Hard CI gate. When `git push origin main --tags` fires both CI and
   # Release in parallel, this job polls the CI workflow run for the
   # tag's commit until it settles on `success`. Both downstream jobs
-  # (`release`, `publish-npm`) `needs: ci-green`, so a red CI blocks
-  # the GitHub Release creation AND the npm publish — neither can
-  # fire alone. Polls up to ~5 minutes (CI itself runs ~15s, the
-  # slack absorbs the parallel-release runner queue).
+  # (`release`, `npm-publish-disabled`) `needs: ci-green`, so a red CI
+  # blocks the GitHub Release creation — it cannot fire alone. Polls up
+  # to ~5 minutes (CI itself runs ~15s, the slack absorbs the
+  # parallel-release runner queue).
   ci-green:
     runs-on: ubuntu-latest
     steps:
@@ -45,8 +45,7 @@ jobs:
 
   # GitHub Release: created only after `ci-green` succeeds. The
   # changelog query validates the release notes (fail fast if the
-  # version section is missing). `publish-npm` waits on `release`,
-  # so npm and GitHub Release cannot drift apart.
+  # version section is missing).
   release:
     needs: ci-green
     runs-on: ubuntu-latest
@@ -64,19 +63,24 @@ jobs:
           body: ${{ steps.changelog.outputs.release-notes }}
           draft: false
 
-  publish-npm:
+  # This repository does NOT publish to npm, and cannot: package.json is named
+  # `dsh-wechat`, but that bare npm name belongs to the upstream project
+  # (maintainer panpan2026, repository pan17/dsh-wechat) — see the README's
+  # "本仓不发布 npm 包" note. The previous implementation ran
+  # `npm publish` with `secrets.DSH_WECHAT`; every release failed with
+  # `npm error code ENEEDAUTH` (the secret is unset) and would have failed with
+  # 403 even if it were set, because we do not own the name. The job is kept as
+  # an explicit, documented no-op so the tag-triggered release can go green; if
+  # this fork ever ships its own package it must be published under a name we
+  # own (e.g. a `@perrylink/` scope), not the upstream bare name.
+  npm-publish-disabled:
     needs: ci-green
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          # Pin Node 22 to match the helper module's zstd API surface;
-          # see .github/workflows/ci.yml for the rationale.
-          node-version: 22
-          registry-url: 'https://registry.npmjs.org'
-      - run: npm ci
-      - run: npm run build
-      - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.DSH_WECHAT }}
+      - name: Explain why no npm publish happens
+        run: |
+          echo "Skipping npm publish on purpose."
+          echo "package.json is named 'dsh-wechat', but that npm name is owned by"
+          echo "the upstream project (pan17/dsh-wechat); this fork does not own it"
+          echo "and the README states this repository does not publish to npm."
+          echo "See CHANGELOG for the 2026-09-10 note."
