@@ -1,13 +1,13 @@
 /**
- * `/history` provenance filtering:
- *   - Only genuine human turns are listed. The host stamps synthesized
- *     user-role messages with `source.kind` (`plugin` for context injections
- *     and compaction checkpoints, `goal` for goal rounds, `session-reference`
- *     for recalls), and the GUI sidebar lists only `kind === "user"`.
- *   - The persisted fallback prefers `sessionQuery.readSurface()` (current
- *     model surface) and only then `readSession()` (complete raw log).
- *   - Legacy payloads without a `source` stay visible, so nothing real is
- *     hidden by the filter.
+ * `/history` provenance:
+ *   - Synthesized user-role messages (plugin compact checkpoints, goal
+ *     rounds, recalls) are classified as 系统, not 你.
+ *   - Default `/history` lists only human + assistant turns (GUI sidebar
+ *     rule: source.kind === "user"). `/history all` includes 系统.
+ *   - Legacy payloads without a source stay visible as human turns.
+ *   - The persisted fallback still prefers `sessionQuery.readSession()`
+ *     (complete raw log). `readSurface` is not used — restart must not
+ *     drop compacted human turns.
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
@@ -101,13 +101,13 @@ function makeColdBridge(query: Record<string, unknown>): WeChatDSHBridge {
   return boundBridge({ get: (name: string) => (name === "sessionQuery" ? query : undefined), on: () => () => {} });
 }
 
-async function runHistory(bridge: WeChatDSHBridge): Promise<string> {
+async function runHistory(bridge: WeChatDSHBridge, line = "/history"): Promise<string> {
   sendTextMessage.mockClear();
   await (bridge as unknown as { handleMessage: (m: unknown) => Promise<void> }).handleMessage({
     message_type: 1,
     from_user_id: "u1",
     context_token: "ctx",
-    item_list: [{ type: 1, text_item: { text: "/history" } }],
+    item_list: [{ type: 1, text_item: { text: line } }],
   });
   return sendTextMessage.mock.calls.map((c) => String(c[1])).join("\n");
 }
@@ -119,7 +119,7 @@ beforeEach(() => {
 });
 
 describe("/history provenance", () => {
-  it("live history hides injected user-role messages but keeps human turns", async () => {
+  it("default history hides injected user-role messages but keeps human turns", async () => {
     const bridge = makeLiveBridge([
       humanEvent("人类提问", 1),
       injectedEvent("【压缩检查点】被替换掉的历史正文", "plugin", 2),
@@ -128,12 +128,32 @@ describe("/history provenance", () => {
 
     const text = await runHistory(bridge);
 
+    expect(text).toContain("👤 你");
     expect(text).toContain("人类提问");
+    expect(text).toContain("🤖 助手");
     expect(text).toContain("助手回复");
     expect(text).not.toContain("压缩检查点");
+    expect(text).not.toContain("⚙️ 系统");
   });
 
-  it("live history hides goal-round user messages too", async () => {
+  it("/history all lists injected messages as 系统", async () => {
+    const bridge = makeLiveBridge([
+      humanEvent("人类提问", 1),
+      injectedEvent("【压缩检查点】被替换掉的历史正文", "plugin", 2),
+      assistantEvent("助手回复", 3),
+    ]);
+
+    const text = await runHistory(bridge, "/history all");
+
+    expect(text).toContain("👤 你");
+    expect(text).toContain("人类提问");
+    expect(text).toContain("⚙️ 系统");
+    expect(text).toContain("【压缩检查点】被替换掉的历史正文");
+    expect(text).toContain("🤖 助手");
+    expect(text).toContain("助手回复");
+  });
+
+  it("default history also hides goal-round user messages", async () => {
     const bridge = makeLiveBridge([
       humanEvent("人类提问", 1),
       injectedEvent("目标续跑提示词", "goal", 2),
@@ -145,53 +165,69 @@ describe("/history provenance", () => {
     expect(text).not.toContain("目标续跑提示词");
   });
 
-  it("legacy payloads without a source stay visible", async () => {
+  it("legacy payloads without a source stay visible as human turns", async () => {
     const bridge = makeLiveBridge([
       { type: "user/message", time: 1, data: { message: { content: [{ type: "text", text: "legacy user" }] } } },
     ]);
 
     const text = await runHistory(bridge);
 
+    expect(text).toContain("👤 你");
     expect(text).toContain("legacy user");
   });
 
-  it("cold history prefers readSurface and applies the same provenance filter", async () => {
+  it("cold history prefers readSession even when readSurface is exposed", async () => {
+    const readSurface = vi.fn(async () => ({
+      events: [injectedEvent("【压缩检查点】surface 注入", "plugin", 1), assistantEvent("surface assistant", 2)],
+    }));
     const readSession = vi.fn(async () => ({
-      events: [humanEvent("raw-log user", 1), assistantEvent("raw-log assistant", 2)],
+      events: [
+        humanEvent("raw-log user", 1),
+        injectedEvent("【压缩检查点】raw-log 注入", "plugin", 2),
+        assistantEvent("raw-log assistant", 3),
+      ],
     }));
     const bridge = makeColdBridge({
       listSessions: async () => [],
       readTitle: async () => undefined,
       listEvents: async () => [],
-      readSurface: async () => ({
-        events: [
-          humanEvent("surface user", 1),
-          injectedEvent("【压缩检查点】surface 注入", "plugin", 2),
-          assistantEvent("surface assistant", 3),
-        ],
-      }),
+      readSurface,
       readSession,
     });
 
     const text = await runHistory(bridge);
 
-    expect(text).toContain("surface user");
-    expect(text).toContain("surface assistant");
+    expect(text).toContain("👤 你");
+    expect(text).toContain("raw-log user");
+    expect(text).toContain("🤖 助手");
+    expect(text).toContain("raw-log assistant");
     expect(text).not.toContain("压缩检查点");
-    expect(readSession).not.toHaveBeenCalled();
+    expect(text).not.toContain("surface");
+    expect(readSession).toHaveBeenCalled();
+    expect(readSurface).not.toHaveBeenCalled();
   });
 
-  it("cold history falls back to readSession when no surface is exposed", async () => {
+  it("cold /history all still reads the raw log and labels injections 系统", async () => {
     const bridge = makeColdBridge({
       listSessions: async () => [],
       readTitle: async () => undefined,
       listEvents: async () => [],
-      readSession: async () => ({ events: [humanEvent("cold user", 1), assistantEvent("cold assistant", 2)] }),
+      readSession: async () => ({
+        events: [
+          humanEvent("cold user", 1),
+          injectedEvent("【压缩检查点】cold 注入", "plugin", 2),
+          assistantEvent("cold assistant", 3),
+        ],
+      }),
     });
 
-    const text = await runHistory(bridge);
+    const text = await runHistory(bridge, "/history all");
 
+    expect(text).toContain("👤 你");
     expect(text).toContain("cold user");
+    expect(text).toContain("⚙️ 系统");
+    expect(text).toContain("【压缩检查点】cold 注入");
+    expect(text).toContain("🤖 助手");
     expect(text).toContain("cold assistant");
   });
 });

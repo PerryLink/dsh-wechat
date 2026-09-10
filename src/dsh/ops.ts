@@ -101,14 +101,6 @@ export interface SessionQuery {
   /** Lightweight raw-log event records (ascending seq), for recency recovery. */
   listEvents(sessionId: string): Promise<Array<{ type: string; time: number; data?: unknown; seq?: number }>>;
   /**
-   * Complete current model surface (`SessionSurfaceSnapshot`, 0.1.5+): the
-   * events the model actually sees, each carrying its own `data`. Preferred
-   * persisted history source — one fold, no raw-log replay.
-   */
-  readSurface?(sessionId: string): Promise<{
-    events?: Array<{ type: string; time?: number; data?: unknown }>;
-  }>;
-  /**
    * Full validated log (0.1.2+). `listEvents` no longer carries `data`, so
    * `/history` prefers this when the host exposes it.
    */
@@ -142,7 +134,8 @@ export type SessionLogActivity =
   | { ok: false; error: string };
 
 export interface HistoryEntry {
-  role: "user" | "assistant";
+  /** `system` is a synthesized user-role message (compact / plugin / goal / recall). */
+  role: "user" | "assistant" | "system";
   text: string;
   time: number;
 }
@@ -599,22 +592,24 @@ export class DshOps {
   }
 
   /**
-   * Whether one `user/message` payload is a genuine human turn.
+   * Classify one `user/message` payload as a genuine human turn or a
+   * synthesized system injection.
    *
-   * The host attributes synthesized user-role messages to their producer
-   * through `source.kind` — `plugin` for context injections and compaction
-   * checkpoints, `goal` for goal rounds, `session-reference` for recalls,
-   * `agent-message` for relays — and the GUI sidebar lists only
-   * `kind === "user"` (session-turn-outline). Legacy payloads without a
-   * source stay visible.
+   * The host attributes synthesized user-role messages through
+   * `source.kind` — `plugin` (context injections / compaction
+   * checkpoints), `goal` (goal rounds), `session-reference` (recalls),
+   * `agent-message` (relays). The GUI sidebar lists only `kind === "user"`
+   * (session-turn-outline). Legacy payloads without a source stay human
+   * so nothing real is hidden. Nested `data.message.source` is accepted
+   * alongside the host's flat `data.source`.
    */
-  private isHumanUserMessage(data: unknown): boolean {
-    if (!data || typeof data !== "object") return true;
+  private userMessageRole(data: unknown): "user" | "system" {
+    if (!data || typeof data !== "object") return "user";
     const d = data as Record<string, unknown>;
     const direct = (d.source as { kind?: unknown } | undefined)?.kind;
     const nested = ((d.message as Record<string, unknown> | undefined)?.source as { kind?: unknown } | undefined)?.kind;
     const kind = direct ?? nested;
-    return kind === undefined || kind === "user";
+    return kind === undefined || kind === "user" ? "user" : "system";
   }
 
   /** Fold chronological history entries out of surface or raw-log events. */
@@ -624,68 +619,75 @@ export class DshOps {
     const entries: HistoryEntry[] = [];
     for (const ev of events) {
       if (ev.type !== "user/message" && ev.type !== "assistant/message") continue;
-      if (ev.type === "user/message" && !this.isHumanUserMessage(ev.data)) continue;
       const text = this.extractHistoryText(ev.data);
       if (!text) continue;
-      const role = ev.type === "user/message" ? "user" as const : "assistant" as const;
+      const role = ev.type === "user/message" ? this.userMessageRole(ev.data) : "assistant" as const;
       entries.push({ role, text, time: typeof ev.time === "number" ? ev.time : Date.now() });
     }
     return entries;
   }
 
+  private takeHistoryWindow(entries: HistoryEntry[], cap: number, includeSystem: boolean): HistoryEntry[] {
+    const visible = includeSystem ? entries : entries.filter((e) => e.role !== "system");
+    return visible.slice(-cap);
+  }
+
   /**
-   * Retrieve the most recent `limit` conversation entries (user + assistant)
-   * for `sessionId`, ordered oldest→newest.
+   * Retrieve the most recent `limit` conversation entries for `sessionId`,
+   * ordered oldest→newest.
    *
    * Strategy:
    *  1. Try in-memory `session.snapshotEvents()` (0.1.5) or the legacy
    *     `session.events` array via `ctx.get("agents")` — fast, no I/O,
    *     survives even when `sessionQuery` is unavailable.
-   *  2. Fall back to persisted `sessionQuery.readSurface(sessionId)` (current
-   *     model surface), then `readSession(sessionId)` (complete raw log).
-   *     `listEvents` is metadata-only since 0.1.2 and cannot reconstruct text.
+   *  2. Fall back to persisted `sessionQuery.readSession(sessionId)` (full
+   *     raw log with `data`). `listEvents` is metadata-only since 0.1.2
+   *     and cannot reconstruct text.
    *
-   * Filters to `user/message` (role=user) and `assistant/message`
-   * (role=assistant). Other event types (tool results, system, etc.) are
-   * ignored to keep the WeChat view concise, and synthesized user-role
-   * messages (see {@link isHumanUserMessage}) never masquerade as turns.
+   * Folds `user/message` and `assistant/message`. Synthesized user-role
+   * messages (see {@link userMessageRole}) are tagged `system` and omitted
+   * unless `includeSystem` is set. Other event types (tool results, true
+   * `system/message`, etc.) stay out of the WeChat view.
    *
    * Returns `[]` on any error or when no history exists — caller renders
    * a friendly empty-state message.
    */
-  async getSessionHistory(sessionId: string, limit: number): Promise<HistoryEntry[]> {
+  async getSessionHistory(
+    sessionId: string,
+    limit: number,
+    opts?: { includeSystem?: boolean },
+  ): Promise<HistoryEntry[]> {
     const cap = Math.max(1, Math.min(limit, 20));
+    const includeSystem = opts?.includeSystem === true;
     // 1) In-memory fast path
     try {
       const agents = this.get<{ get(id: string): { session?: AgentSession } | undefined }>("agents");
       const agent = agents?.get(sessionId);
       const events = sessionEvents(agent?.session);
       if (events.length > 0) {
-        const entries = this.historyEntries(events);
+        const entries = this.takeHistoryWindow(this.historyEntries(events), cap, includeSystem);
         if (entries.length > 0) {
           // events are already in chronological order (ascending seq)
-          return entries.slice(-cap);
+          return entries;
         }
       }
     } catch {
       // fall through to persisted path
     }
 
-    // 2) Persisted fallback: current model surface first, then the raw log.
+    // 2) Persisted fallback. Prefer `readSession` (full events with `data`);
+    // `listEvents` in 0.1.2 is metadata-only and cannot reconstruct text.
     const query = this.get<SessionQuery>("sessionQuery");
     if (!query) return [];
     try {
-      let records: readonly { type: string; time?: number; data?: unknown }[] = [];
-      if (typeof query.readSurface === "function") {
-        records = (await query.readSurface(sessionId))?.events ?? [];
-      }
-      if (records.length === 0 && typeof query.readSession === "function") {
-        records = (await query.readSession(sessionId))?.events ?? [];
-      }
-      if (records.length === 0) {
+      let records: Array<{ type: string; time?: number; data?: unknown }> = [];
+      if (typeof query.readSession === "function") {
+        const snapshot = await query.readSession(sessionId);
+        records = snapshot.events ?? [];
+      } else {
         records = await query.listEvents(sessionId);
       }
-      return this.historyEntries(records).slice(-cap);
+      return this.takeHistoryWindow(this.historyEntries(records), cap, includeSystem);
     } catch {
       return [];
     }

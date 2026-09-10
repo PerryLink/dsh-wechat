@@ -9,6 +9,19 @@
 
 - The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
 
+## [0.9.6] - 2026-09-10
+
+### Changed
+
+- `/history` 默认只列真人轮次和助手回复；压缩检查点、插件注入、goal 续跑等合成 user 消息标成「系统」，用 `/history all` 一起查看。冷路径仍读完整原始日志，不改成模型当前面。
+- `/history` 每条改成独立一块：`👤 你` / `🤖 助手` / `⚙️ 系统` 单独一行，正文保留原来的换行，不再压成一行摘要。
+
+## [0.9.5] - 2026-09-10
+
+### Fixed
+
+- `/status` 的「权限」行和 `/perm list` 的「当前会话」标记在 DSH 0.1.5 上不再静默消失。`permissionPresets.current()` 改为传入活 Session（宿主自 0.1.2-alpha.2 起走 `sessionProjections.stateOf(session, "permissions")`），不再传事件数组。
+
 ## [0.9.4] - 2026-09-10
 
 ### Fixed
