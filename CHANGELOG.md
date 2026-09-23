@@ -3,9 +3,17 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.9.7] - 2026-09-23
+
+### Changed
+
+- The README's development note now describes the vitest suite as the `DSH 0.1.7-alpha.2` adaptation; it still named `0.1.7-alpha.1`. dsh-wechat declares no `@deepseek-ai/*` peer or dev dependency and has no compat workflow, so there is no pin, peer band or CI probe to move — `engines.dsh` is the only host-line declaration this repository makes.
+- Publishing note: this repository deliberately does not publish to npm. `package.json` is named `dsh-wechat`, but that bare npm name belongs to the upstream project (`pan17/dsh-wechat`). A tag-triggered release therefore produces the GitHub Release only; the npm job is the documented `npm-publish-disabled` no-op described below.
 
 ### Fixed
+
+- `engines.dsh` read `>=0.1.5-rc.1` — a floor with no ceiling, which looks like it admits everything newer and in fact admits almost nothing newer. Under npm semver's prerelease rule a range only admits a prerelease version when some comparator carries the same `[major, minor, patch]` tuple **and** a prerelease; the single comparator sits on the `0.1.5` tuple, so `0.1.5-rc.2` was admitted while `0.1.6-alpha.2` and `0.1.7-alpha.2` were both rejected — including the line this workspace now targets. It now reads `>=0.1.5-rc.1 || >=0.1.7-0 <0.2.0`. The original arm is kept verbatim, nothing is narrowed, `0.1.5-rc.2` still satisfies the range, and the added arm is what actually admits the 0.1.7 prerelease line. Verified against semver directly rather than by reading the string.
+- The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
 
 - The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
 
