@@ -4,6 +4,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/dsh-wechat?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-wechat)
 [![License](https://img.shields.io/github/license/pan17/dsh-wechat?style=flat-square)](https://github.com/pan17/dsh-wechat)
 [![dsh-doctor](https://raw.githubusercontent.com/PerryLink/dsh-plugin-doctor/main/badges/PerryLink__dsh-wechat.svg)](https://github.com/PerryLink/dsh-plugin-doctor#verified-寰界珷)
+[![DSH Market](https://raw.githubusercontent.com/2BingLing/dsh-market/master/assets/readme/badge-listed-en.svg)](https://dsh.market/)
 
 让微信成为 DeepSeek Harness (DSH) 的第二客户端：通过腾讯 iLink bot 协议把
 微信私聊桥接到 DSH agent——文本/图片/文件/语音消息双向收发、微信内 slash
@@ -12,6 +13,12 @@ DSH 设置页内扫码登录与连接配置。以静态 Cordis 插件交付，�
 `@deepseek-ai` 依赖，直接调用 DSH 进程内服务。
 
 <img src="./resources/send.jpg" alt="发送" width="32%" /> <img src="./resources/receive.jpg" alt="接收" width="32%" /> <img src="./resources/settings.png" alt="设置页" width="32%" />
+
+## What is dsh-wechat?
+
+Full evidence, including the host-version compatibility matrix: `dsh-plugin-supersession-review-20261005.md`.
+
+![dsh-wechat 终端演示：dsh-wechat — 安装到 profile，扫码登录，微信内命令](https://raw.githubusercontent.com/PerryLink/dsh-wechat/main/docs/assets/dsh-wechat-demo.png)
 
 ## Maintenance status: 🧊 FROZEN
 
@@ -55,6 +62,10 @@ Maintainers treat this capability as one where **better-adopted alternatives now
 - **单用户** — 只服务第一个微信用户；bot token 缺失/失效时不向微信推送，日志会写明原因（需重新扫码或等会话恢复）
 
 ## 安装（部署到 DSH profile）
+
+```sh
+dsh plugin --profile web add dsh-wechat
+```
 
 DSH 自带插件管理命令 `dsh plugin`（在 profile 目录转发 pnpm，并自动把
 声明了 `dsh.bundle` 的依赖加入 bundle 层）：
@@ -231,6 +242,12 @@ MIT。`src/weixin/`、`src/adapter/` 移植自
 本项目与 DeepSeek Harness、腾讯微信官方**互不隶属**，非官方项目，
 纯属个人学习用途。使用本项目即表示你自行承担由此产生的一切后果。
 
+
+## Comparison
+
+![dsh-wechat 的实测对比柱状图](https://raw.githubusercontent.com/PerryLink/dsh-wechat/main/docs/assets/dsh-wechat-evidence.png)
+
+measured 2026-10-05 · from the README's FROZEN maintenance table (npm weekly downloads)
 
 ## PerryLink DSH Plugin Family
 
