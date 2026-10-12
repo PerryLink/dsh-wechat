@@ -30,6 +30,9 @@ export interface PluginConfig {
   textChunkLimit?: number;
   cardTimeoutMs?: number;
   silent?: boolean;
+  finalOnly?: boolean;
+  finalOnlyIdleMs?: number;
+  finalOnlyCeilingMs?: number;
   surfacePromptEnabled?: boolean;
   surfacePrompt?: string;
 }
@@ -63,6 +66,20 @@ export function apply(ctx: unknown, rawConfig: PluginConfig = {}): () => Promise
     bridge.handleSessionEvent(sessionId, event as { type: string; [k: string]: unknown });
   });
   console.log("[dsh-wechat] session/event listener attached");
+
+  // ─── Agent idleness → 结论模式 (final-only) quiescence ───
+  // The goal round-driver wakes the NEXT round exactly when `agent.status`
+  // flips to `idle`, so this is also the signal that tells the hold "more
+  // rounds are coming" (running cancels the countdown) versus "the task is
+  // genuinely finished" (idle arms it). `agent.id` IS the session id in DSH
+  // (`Agent.id: SessionId`), so no session lookup is needed.
+  context.on("agent/status", (payload) => {
+    const data = payload as { agent?: { id?: string }; status?: string };
+    const sessionId = data?.agent?.id;
+    const status = data?.status;
+    if (!sessionId || !status) return;
+    bridge.handleAgentStatus(sessionId, status);
+  });
 
   // ─── Agent errors → WeChat notification ───
   context.on("agent/error", (payload) => {

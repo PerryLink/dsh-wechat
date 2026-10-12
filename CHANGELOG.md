@@ -3,6 +3,37 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - 2026-10-12
+
+### Added
+
+- **结论模式 / final-only（设置页新开关，配置键 `finalOnly`，默认关）**——只回最终结论，中间过程一律不推。此前**没有任何开关能解决**这一场景：一次需求会创建一个 goal，其 round-driver 在 `agent/status → idle` 时自动续跑，**每一轮都是一次独立的 DSH turn**；`silent` 的单位是「轮」，所以 8 轮仍然发 8 条。结论模式把推送触发点从 *turn/end* 改成 ***整条续跑链彻底停下之后***：助手正文与跨会话完成卡都写进按会话的暂存表，静默期内只保留最后一条，到期后作为**一条**结论交付。
+  - 交付格式：只有一轮时原文直发；多轮时前缀一行 `✅ 已完成（共 N 轮）`，正文只取最后一段（不逐轮罗列，不拼接）。
+  - 静默期 `finalOnlyIdleMs`（默认 45 秒）：助手正文、`turn/end`、`agent/status` 空闲都会把它重新推后；`agent/status` 运行中（下一轮已经开始）会取消倒计时。
+  - 硬顶 `finalOnlyCeilingMs`（默认 10 分钟）：从**第一次**暂存起算，且是独立定时器，不被 re-arm 清掉，保证长任务不会永久沉默。
+  - **期间安全**：权限卡、提问卡、超时提示、报错一律**立即**推送，不受压制；报错还会丢弃暂存，避免错误之后再补一条过期结论。
+  - 逃生口：微信 `/flush`（别名 `/f`）立即取回暂存结论；也可以直接发下一条需求——新人消息到达时会先交付上一件事的结论。
+  - 覆盖两条洪水路径：绑定会话的逐轮正文（`assistant/message` / `turn/end` flush）与跨会话的 `✅ 任务已完成` 卡片。
+  - 生命周期清理：`stop()`、重连/重新扫码/退出登录、`resetPeerBinding()` 都会丢弃暂存且不发送。
+  - 优先级：`finalOnly` 开启时压过 `silent`；枚举式开关会与 `silent` 语义重复，因此保留现有 `silent` 不动、只加一个布尔开关（向后兼容，零迁移）。
+- `/status` 增加「结论模式」行，开启时显示当前暂存条数。
+- `/flush`（`/f`）加入帮助表与 bypass 命令表（有待处理卡时也绕过卡片直接执行，与 `/next` 同款语义）。
+
+### Fixed
+
+- **`/stop` 在 DSH 0.2.x 上会让宿主抛错**：`agent.cancel("user-stop")` 传的是字符串，而 0.2.x 的 `AgentCancelCause` 是对象联合（`{kind:'user'|'parent'|'hook'|'disposed'}`），`packages/core/agent-loop/src/agent.ts` 的 `abortedCancelCause` 以 `assertNever` 收尾 ⇒ `unreachable variant: "user-stop"`，并会在下一次 `followup`/`steer` 或轮次 catch 路径上触发。现改为 `agent.cancel({ kind: "user" })`，并把 `AgentHandle.cancel` 的结构化类型收窄为真实联合。
+- **`/preset` 设置默认 Preset 自 0.1.7 起是静默空操作**：设置命名空间是按 profile 配置行 id 解析的，宿主在 0.1.7 把该行由 `agent-presets` 改名为 `agent-preset-registry`，字段由 `default` 改为 `selectedDefault`。写入旧组合会被 `settings.update` 拒绝（`No configurable plugin entry`）并被 catch 吞掉，只留一句「无法写入 DSH 设置」。现按「新组合优先、旧组合兜底」两次尝试，0.1.5 与 0.1.7+ 都能真正写入。
+- **`sessionProjectionCache.cachedSnapshot(header, 0)` 在 0.1.7+ 必抛**：第二个参数已由 `inheritedEventCount: number` 改为可选的投影键数组（直接喂 `new Set(keys)`），传 `0` 得到 `TypeError: number 0 is not iterable`，被 try/catch 吞掉后 `/s list`、`/s new` 静默失去零 I/O 列表提示、回落到读原始日志。现改为不传第二个参数，并同步修正结构化类型。
+- **`engines.dsh` 曾把整个 0.2.x 前发布线判为不兼容**：`>=0.1.5-rc.1 || >=0.1.7-0 <0.2.0` 的两个 arm 分别落在 0.1.5 与 0.1.7 元组上，按 node-semver 的前发布元组规则，**默认语义下 `0.2.0-rc.2` 是被拒绝的**（0.2.1 宿主之所以放行，只是因为它传了 `{ includePrerelease: true }`）；同时第一个 arm 无上界，反而放行 `0.3.0` 与 `1.0.0`。现改为逐元组枚举并在 0.3.0 前设精确上界：`>=0.1.5-rc.1 <0.2.0 || >=0.1.7-0 <0.2.0 || >=0.2.0-0 <0.3.0-0 || >=0.2.1-0 <0.3.0-0`，在**默认与 includePrerelease 两种语义下**都放行 0.1.5-rc.1 → 0.2.1 且拒绝 0.3.0-rc.1 / 1.0.0。新增 `tests/host-line.test.ts` 用真实 `semver` 把这张矩阵钉死（`semver` 因此进入 devDependencies）。
+- 一处 `engines.dsh` 相关的事实澄清：该字段在 0.2.x 宿主上是**声明性**的——`evaluatePluginCompatibility` 只校验 `peerDependencies`，没有任何代码读 `engines`。也就是说此前的错误范围不会在运行时拦截安装，但它是对外的**兼容性声明**（插件目录、doctor 门禁、npm 页面都读它），所以仍然必须写对。本仓继续刻意不声明 `@deepseek-ai/dsh` peer（零运行时依赖原则）；一旦声明，错误的范围会让宿主**整层跳过** `dsh-wechat` bundle（`profile.ts` 抛错 → `skippedBundles`），`tests/host-line.test.ts` 因此同时把「不得顺手加上 peer」钉住。
+
+### Tests
+
+- 新增 `tests/final-only.test.ts`（16 例）：8 轮 goal 续跑 → **恰好 1 条**且含第 8 轮正文；同样的 8 轮在 `silent` 下仍为 8 条（钉住这次修复的正是这个缺口）；关闭时逐条直发；只交付最后一段而不拼接；权限卡/报错不被压住；报错丢弃暂存；新人消息先交付上一件事的结论；goal 续跑**不**触发交付；硬顶在永不空闲时仍交付一次；`agent/status` 运行取消 / 空闲重新计时；`/flush` 立即交付且是 bypass 命令；跨会话 8 轮折叠为 1 条；`stop()` 与换绑丢弃暂存。
+- 新增 `tests/host-line.test.ts`（20 例）：用真实 `semver` 在两种语义下钉住 `engines.dsh` 的准入/拒绝矩阵，并断言未声明 `@deepseek-ai/dsh` peer。
+- 新增 `tests/client-panel-wiring.test.ts`（22 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起。
+- `tests/config-store.test.ts` 增加结论模式三个键的持久化、非法值拒绝与默认值断言。
+
 ## [0.9.8] - 2026-10-10
 
 ### Changed

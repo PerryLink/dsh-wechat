@@ -179,6 +179,7 @@ window.__ModuleLoader__.load({
 						surfacePromptEnabled: !!r.body.config?.surfacePromptEnabled,
 						surfacePrompt: r.body.config?.surfacePrompt ?? "",
 						silent: !!(r.body.config?.silent ?? (firstUser && firstUser.silent)),
+						finalOnly: !!r.body.config?.finalOnly,
 					});
 				}).catch(() => {});
 			}, []);
@@ -234,6 +235,7 @@ window.__ModuleLoader__.load({
 							crossSessionNotify: !!form.crossSessionNotify,
 							notifyTaskEvents: !!form.notifyTaskEvents,
 							silent: !!form.silent,
+							finalOnly: !!form.finalOnly,
 							surfacePromptEnabled: !!form.surfacePromptEnabled,
 							surfacePrompt: form.surfacePrompt,
 						}),
@@ -345,7 +347,12 @@ window.__ModuleLoader__.load({
 						createElement("label", { className: "wx_check" },
 							createElement("input", { type: "checkbox", checked: !!form?.silent, onChange: (e) => setForm({ ...form, silent: e.target.checked }) }),
 							createElement("span", null, "静默"),
-							createElement(HelpTip, { text: "开启后 agent 每轮的中间过程（工具调用、思考等）不再逐条推送，只在轮次结束时发送最终回复，避免刷屏。" }),
+							createElement(HelpTip, { text: "开启后 agent 每轮的中间过程（工具调用、思考等）不再逐条推送，只在轮次结束时发送最终回复，避免刷屏。注意单位是「轮」：一次需求若被拆成多轮（例如目标自动续跑 8 轮），仍然会收到 8 条。" }),
+						),
+						createElement("label", { className: "wx_check" },
+							createElement("input", { type: "checkbox", checked: !!form?.finalOnly, onChange: (e) => setForm({ ...form, finalOnly: e.target.checked }) }),
+							createElement("span", null, "结论模式"),
+							createElement(HelpTip, { text: "只回最终结论：跨轮次的中间过程一律暂存，整条任务彻底停下来后只发一条最终结论（自动续跑再多轮也只发一条）。权限卡、提问卡、报错始终立即推送，不会被压住。默认静默 45 秒后交付，最长 10 分钟必发一次；想看当前进度可随时在微信发 /flush。开启后优先于「静默」。" }),
 						),
 						createElement("label", { className: "wx_check" },
 							createElement("input", { type: "checkbox", checked: !!form?.surfacePromptEnabled, onChange: (e) => setForm({ ...form, surfacePromptEnabled: e.target.checked }) }),

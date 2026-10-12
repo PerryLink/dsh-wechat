@@ -114,6 +114,16 @@ export function parseNextCommand(text: string): boolean {
   return text.trim().toLowerCase() === "/next";
 }
 
+/**
+ * Parse `/flush` (alias `/f`) — deliver whatever 结论模式 (final-only) is
+ * currently holding, without waiting for the quiescence timer. This is the
+ * escape hatch for "I can see it is done, tell me now".
+ */
+export function parseFlushCommand(text: string): boolean {
+  const trimmed = text.trim().toLowerCase();
+  return trimmed === "/flush" || trimmed === "/f";
+}
+
 /** Parse `/reject-question` (alias `/rq`). */
 export function parseRejectQuestionCommand(text: string): RejectQuestionCommand | null {
   const trimmed = text.trim().toLowerCase();
@@ -562,6 +572,7 @@ export function isBypassSlashCommand(text: string): boolean {
   return (
     parseHelpCommand(text) ||
     parseNextCommand(text) ||
+    parseFlushCommand(text) ||
     parseSilentCommand(text) !== null ||
     parseSurfaceCommand(text) !== null ||
     parseStatusCommand(text) !== null ||
@@ -609,6 +620,8 @@ export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "wxprompt",
   "stop",
   "next",
+  "flush",
+  "f",
   "history",
   "rp",
   "reject-permission",
@@ -635,7 +648,8 @@ export function formatHelp(
     "• /perm (permission) — status | list | switch <名称|编号> | default [名称|编号]（会话权限实时切换；默认写入 DSH 设置，与 GUI 同步）",
     "• /reasoning — 查看/设置推理等级：/reasoning [list|default|switch <等级>]",
     "• /enter (busy) — queue|steer|status 繁忙时消息投递（排队/插话，与 DSH 设置「繁忙时 Enter 键行为」同步）",
-    "• /silent on|off (sl) — 静默模式：只发送每轮最终回复",
+    "• /silent on|off (sl) — 静默模式：只发送每轮最终回复（单位是「轮」）",
+    "• /flush (f) — 立即取回结论模式暂存的最终结论，不必等静默期",
     "• /surface on|off|status (wxprompt) — 微信渠道提示词注入开关（默认关；正文在设置页编辑）",
     "• /notify on|off|status (watch) — 跨会话决策推送：权限/提问卡整卡（默认关闭）；/notify tasks on|off 后台任务完成/报错提醒",
     "• /history [all] [数量] — 查看最近历史（默认 5 条，最多 20 条；默认只看你和助手，all 含压缩/注入等系统消息）；有待处理卡时会完整重发",

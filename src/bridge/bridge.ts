@@ -58,6 +58,7 @@ import {
   parseModelCommand,
   splitProviderModelTarget,
   parseNextCommand,
+  parseFlushCommand,
   parseNotifyCommand,
   parsePermCommand,
   parsePresetCommand,
@@ -161,6 +162,33 @@ interface PendingQuestion {
   settled: boolean;
   settleWechat: ((answer: AskUserQuestionAnswer) => void) | null;
   cancelWechat: ((reason: unknown) => void) | null;
+}
+
+/**
+ * One held conclusion for a session under 结论模式 (`config.finalOnly`).
+ * The entry accumulates instead of sending: `body` keeps the latest full
+ * assistant text, `notice` the preview a cross-session completion card would
+ * have carried, and `rounds` counts how many turn ends were folded in, so the
+ * delivered digest can say how many rounds it stands for.
+ */
+interface PendingFinal {
+  sessionId: string;
+  /** Recipient the digest is delivered to (re-resolved from the bound user). */
+  userId: string;
+  /** Latest full assistant body held for this task; wins over `notice`. */
+  body: string;
+  /** Cross-session completion preview; used only while no `body` exists. */
+  notice: string;
+  /** Turn ends folded into this entry (1 = a single ordinary turn). */
+  rounds: number;
+  /** When the first hold happened — the hard ceiling is measured from here. */
+  firstAt: number;
+  /** Last activity; informational only (the timers are authoritative). */
+  lastAt: number;
+  /** Quiescence timer: fires `finalOnlyIdleMs` after the last activity. */
+  settle?: NodeJS.Timeout;
+  /** Hard ceiling timer: fires `finalOnlyCeilingMs` after `firstAt`. */
+  ceiling?: NodeJS.Timeout;
 }
 
 /**
@@ -290,6 +318,27 @@ export class WeChatDSHBridge {
    */
   private readonly pushedCardRpcIds = new Map<string, Set<string>>();
   private readonly silentBuffers = new Map<string, string[]>();
+  /**
+   * 结论模式 (final-only) hold table, keyed by session id. While
+   * `config.finalOnly` is on, neither the bound session's assistant text nor
+   * a cross-session task notice is pushed as it happens: each is folded into
+   * the entry for its session and the whole entry is delivered ONCE, after
+   * the task has been quiet for `finalOnlyIdleMs` (or at the
+   * `finalOnlyCeilingMs` hard ceiling). This is what collapses a goal that
+   * auto-continues over N rounds — each round is a separate DSH turn, so the
+   * per-turn `silent` mode still emits one message per round — into a single
+   * conclusion.
+   */
+  private readonly pendingFinal = new Map<string, PendingFinal>();
+  /**
+   * Session id → the `round` of the goal message currently driving the turn,
+   * as carried by `user/message` `data.source` (`{kind:'goal',round}`).
+   * Present exactly while an automatic goal continuation is driving, absent
+   * while a human message drives. Used to tell "the user asked something"
+   * apart from "the goal loop re-entered", which is the difference between
+   * "deliver the previous conclusion now" and "keep holding".
+   */
+  private readonly currentGoalRound = new Map<string, number>();
   /** One global queue and budget: dsh-wechat intentionally serves one peer. */
   private outboundCache: CachedMessage[] = [];
   private wechatMsgCount = 0;
@@ -851,6 +900,8 @@ export class WeChatDSHBridge {
   async stop(): Promise<void> {
     this.stopIlink("plugin-stop");
     this.stopInteraction();
+    // Held conclusions die with the plugin: nothing is delivered on dispose.
+    this.discardPendingFinal();
   }
 
   /** Stop the WeChat long-poll and typing indicators; leave Host answerers running. */
@@ -927,6 +978,7 @@ export class WeChatDSHBridge {
     this.pendingApprovals.clear();
     this.pushedCardRpcIds.clear();
     this.notifiedCrossSessionTurns.clear();
+    this.discardPendingFinal();
     try {
       this.state.clearUsers();
     } catch (err) {
@@ -953,6 +1005,7 @@ export class WeChatDSHBridge {
     this.cacheNoticeSent = false;
     this.wechatMsgCount = 0;
     this.silentBuffers.clear();
+    this.discardPendingFinal();
     this.persistOutboundState();
     if (parked > 0) {
       this.log(`discarded ${parked} queued outbound item(s) on ${reason}`);
@@ -1234,6 +1287,17 @@ export class WeChatDSHBridge {
         return;
       }
 
+      if (parseFlushCommand(text)) {
+        const flushed = await this.flushAllPendingFinal("command");
+        await this.sendReply(
+          userId,
+          flushed > 0
+            ? `📤 已立即取回 ${flushed} 条暂存的最终结论。`
+            : "📭 当前没有暂存的结论（结论模式未开启，或已交付）。",
+        );
+        return;
+      }
+
       const surface = parseSurfaceCommand(text);
       if (surface) {
         await this.handleSurfaceCommand(userId, surface);
@@ -1440,6 +1504,33 @@ export class WeChatDSHBridge {
       }
     }
 
+    // Remember whether an automatic goal continuation is driving this turn.
+    // `source.kind === "goal"` is the host's own durable attribution of a
+    // round the round-driver injected (`{kind:'goal',goalId,revision,round}`);
+    // a human prompt is `{kind:'user'}`. Subagent settlements
+    // (`subagent-settled`) and background-job wakes (`tool-jobs`) are
+    // automatic too, so they count as "not human" alongside goal rounds.
+    if (event.type === "user/message") {
+      const source = (event.data as { source?: { kind?: string; round?: number } })?.source;
+      const kind = source?.kind;
+      if (kind === "goal") {
+        this.currentGoalRound.set(
+          sessionId,
+          typeof source?.round === "number" ? source.round : 0,
+        );
+      } else if (kind === "user") {
+        this.currentGoalRound.delete(sessionId);
+        // The user is speaking again: whatever is still held belongs to the
+        // PREVIOUS request, so deliver it before the new task starts holding.
+        if (this.finalOnlyEnabled() && this.pendingFinal.has(sessionId)) {
+          void this.flushPendingFinal(sessionId, "new-user-message");
+        }
+      } else if (kind !== undefined) {
+        // subagent-settled / tool-jobs / plugin-injected: automatic.
+        this.currentGoalRound.set(sessionId, -1);
+      }
+    }
+
     // Track last assistant text for cross-session completion preview (for any session)
     if (event.type === "assistant/message") {
       const data = event.data as { message?: { content?: Array<{ type: string; text?: string }> } };
@@ -1471,11 +1562,19 @@ export class WeChatDSHBridge {
           const preview = this.lastAssistantTextBySession.get(sessionId);
           const suffix = preview ? "\n> " + preview.slice(0, 80) + (preview.length > 80 ? "…" : "") : "";
           const body = ctx + "\n✅ 任务已完成" + suffix + "\n发送 /session switch <编号> 切换查看。";
-          if (!this.botReady()) continue;
           const set = this.notifiedCrossSessionTurns.get(r.userId) ?? new Set<string>();
           if (set.has(sessionId)) continue;
           set.add(sessionId);
           this.notifiedCrossSessionTurns.set(r.userId, set);
+          // 结论模式: fold this round's completion card into the task's hold
+          // instead of emitting one card per auto-continued round.
+          if (this.finalOnlyEnabled()) {
+            this.foldFinalRound(sessionId);
+            this.holdFinalNotice(r.userId, sessionId, body);
+            setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
+            continue;
+          }
+          if (!this.botReady()) continue;
           void this.sendReply(r.userId, body).catch(() => {});
           setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
         }
@@ -1494,6 +1593,13 @@ export class WeChatDSHBridge {
         // cancel here. agent.status is still "running" while text is being
         // produced; the indicator mirrors that status and is only removed
         // on turn/end / agent/error / plugin stop.
+        //
+        // 结论模式 (per-task) outranks 静默 (per-turn): hold the text and let
+        // the quiescence timer deliver the conclusion once the whole task —
+        // every auto-continued round included — has stopped.
+        if (this.holdFinalText(user.userId, sessionId, text)) {
+          break;
+        }
         if (this.isSilent()) {
           const buffer = this.silentBuffers.get(sessionId) ?? [];
           buffer.push(text);
@@ -1505,6 +1611,22 @@ export class WeChatDSHBridge {
       }
       case "turn/end": {
         const buffer = this.silentBuffers.get(sessionId);
+        if (this.finalOnlyEnabled()) {
+          // Whatever the per-turn buffer still held belongs to this task's
+          // conclusion; fold it in and count the round.
+          if (buffer && buffer.length > 0) {
+            this.silentBuffers.delete(sessionId);
+            this.holdFinalText(user.userId, sessionId, buffer[buffer.length - 1]!);
+          }
+          this.foldFinalRound(sessionId);
+          // A turn boundary is activity too: restart the countdown so a turn
+          // whose tail ran longer than the idle window still settles cleanly.
+          const held = this.pendingFinal.get(sessionId);
+          if (held) this.armFinalSettle(held);
+          this.clearCrossSessionTurnNotified(user.userId, sessionId);
+          this.endTyping(user.userId, "turn-end");
+          break;
+        }
         if (buffer && buffer.length > 0) {
           this.silentBuffers.delete(sessionId);
           // Silent mode: only the last text of the turn reaches WeChat.
@@ -1520,6 +1642,183 @@ export class WeChatDSHBridge {
     }
   }
 
+  // ─── 结论模式 / Final-only hold (per-TASK, not per-turn) ───
+  //
+  // `silent` collapses the intermediate steps *within* one turn; it still
+  // emits one message per turn, so a goal that auto-continues over N rounds
+  // (each round is its own DSH turn, woken by the round driver on
+  // `agent/status → idle`) still produces N messages. `finalOnly` instead
+  // holds every push — the bound session's assistant text AND the
+  // cross-session "✅ 任务已完成" notices — and delivers exactly one
+  // consolidated conclusion once the whole task has gone quiet.
+
+  /** Whether 结论模式 (per-task hold) is on. Supersedes `silent`. */
+  private finalOnlyEnabled(): boolean {
+    return this.config.finalOnly === true;
+  }
+
+  private finalOnlyIdleMs(): number {
+    const value = this.config.finalOnlyIdleMs;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 45_000;
+  }
+
+  private finalOnlyCeilingMs(): number {
+    const value = this.config.finalOnlyCeilingMs;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 10 * 60_000;
+  }
+
+  private ensurePendingFinal(sessionId: string, userId: string): PendingFinal {
+    const existing = this.pendingFinal.get(sessionId);
+    if (existing) return existing;
+    const now = Date.now();
+    const entry: PendingFinal = {
+      sessionId,
+      userId,
+      body: "",
+      notice: "",
+      rounds: 0,
+      firstAt: now,
+      lastAt: now,
+    };
+    this.pendingFinal.set(sessionId, entry);
+    // The ceiling is measured from the FIRST hold and is never re-armed, so a
+    // task that never goes quiet still reports in at least once per window.
+    entry.ceiling = setTimeout(
+      () => void this.flushPendingFinal(sessionId, "ceiling"),
+      this.finalOnlyCeilingMs(),
+    );
+    entry.ceiling.unref?.();
+    return entry;
+  }
+
+  /** (Re)arm the quiescence timer: every activity event pushes delivery back. */
+  private armFinalSettle(entry: PendingFinal): void {
+    if (entry.settle) clearTimeout(entry.settle);
+    const remaining = entry.firstAt + this.finalOnlyCeilingMs() - Date.now();
+    const delay = Math.max(0, Math.min(this.finalOnlyIdleMs(), remaining));
+    entry.settle = setTimeout(() => void this.flushPendingFinal(entry.sessionId, "idle"), delay);
+    entry.settle.unref?.();
+  }
+
+  /** A turn started (or a new round was queued): stop the countdown. */
+  private cancelFinalSettle(sessionId: string): void {
+    const entry = this.pendingFinal.get(sessionId);
+    if (entry?.settle) {
+      clearTimeout(entry.settle);
+      entry.settle = undefined;
+    }
+  }
+
+  /**
+   * Hold one assistant text. Returns true when the caller must NOT deliver it
+   * now (the hold owns delivery from here on).
+   */
+  private holdFinalText(userId: string, sessionId: string, text: string): boolean {
+    if (!this.finalOnlyEnabled()) return false;
+    const entry = this.ensurePendingFinal(sessionId, userId);
+    entry.userId = userId;
+    entry.body = text;
+    entry.lastAt = Date.now();
+    this.armFinalSettle(entry);
+    return true;
+  }
+
+  /**
+   * Fold a cross-session completion notice into the hold. A real assistant
+   * body always wins over the 80-char preview, so a bound session keeps its
+   * full conclusion while an unbound one still collapses to one message.
+   */
+  private holdFinalNotice(userId: string, sessionId: string, notice: string): void {
+    const entry = this.ensurePendingFinal(sessionId, userId);
+    entry.userId = userId;
+    if (!entry.body) entry.notice = notice;
+    entry.lastAt = Date.now();
+    this.armFinalSettle(entry);
+  }
+
+  /** Count a finished turn into the hold's round tally (for the digest header). */
+  private foldFinalRound(sessionId: string): void {
+    const entry = this.pendingFinal.get(sessionId);
+    if (entry) entry.rounds += 1;
+  }
+
+  /** True when this session currently has something held back. */
+  hasPendingFinal(sessionId: string): boolean {
+    return this.pendingFinal.has(sessionId);
+  }
+
+  /**
+   * Deliver the held conclusion for one session, if any. Delivery goes
+   * through `sendReply`, so chunking, the outbound budget and the offline
+   * park/queue behaviour are exactly the same as a normal reply.
+   */
+  private async flushPendingFinal(sessionId: string, reason: string): Promise<void> {
+    const entry = this.pendingFinal.get(sessionId);
+    if (!entry) return;
+    this.pendingFinal.delete(sessionId);
+    if (entry.settle) clearTimeout(entry.settle);
+    if (entry.ceiling) clearTimeout(entry.ceiling);
+    const text = entry.body || entry.notice;
+    if (!text) return;
+    const digest = entry.body && entry.rounds > 1
+      ? `✅ 已完成（共 ${entry.rounds} 轮）\n${text}`
+      : text;
+    this.log(`final-only flush ${sessionId} (${reason}, ${entry.rounds} round(s))`);
+    await this.sendReply(entry.userId, digest).catch((err) => {
+      this.log(`final-only flush failed: ${String(err)}`);
+    });
+  }
+
+  /** Deliver everything currently held (the `/flush` escape hatch). */
+  private async flushAllPendingFinal(reason: string): Promise<number> {
+    const sessionIds = [...this.pendingFinal.values()]
+      .sort((a, b) => a.lastAt - b.lastAt)
+      .map((entry) => entry.sessionId);
+    for (const sessionId of sessionIds) {
+      await this.flushPendingFinal(sessionId, reason);
+    }
+    return sessionIds.length;
+  }
+
+  /** Throw the held conclusions away without delivering (stop / re-bind). */
+  private discardPendingFinal(): void {
+    for (const entry of this.pendingFinal.values()) {
+      if (entry.settle) clearTimeout(entry.settle);
+      if (entry.ceiling) clearTimeout(entry.ceiling);
+    }
+    this.pendingFinal.clear();
+    this.currentGoalRound.clear();
+  }
+
+  /**
+   * Drop one session's hold without delivering it. Used on error: the error
+   * notice IS the outcome, so a stale "conclusion" must not follow it.
+   */
+  private dropPendingFinal(sessionId: string): void {
+    const entry = this.pendingFinal.get(sessionId);
+    if (!entry) return;
+    this.pendingFinal.delete(sessionId);
+    if (entry.settle) clearTimeout(entry.settle);
+    if (entry.ceiling) clearTimeout(entry.ceiling);
+  }
+
+  /**
+   * `agent/status` mirror: a running agent means a round is in flight, so the
+   * countdown stops; going idle arms it. `agent.id` IS the session id in DSH
+   * (`Agent.id: SessionId`), so no extra mapping is needed.
+   */
+  handleAgentStatus(sessionId: string, status: string): void {
+    if (!this.finalOnlyEnabled()) return;
+    if (status === "running") {
+      this.cancelFinalSettle(sessionId);
+      return;
+    }
+    if (status === "idle") {
+      const entry = this.pendingFinal.get(sessionId);
+      if (entry) this.armFinalSettle(entry);
+    }
+  }
+
   /** Notify the bound user of an agent error. */
   handleAgentError(agentId: string, error: unknown): void {
     const user = this.userForAgent(agentId);
@@ -1528,6 +1827,8 @@ export class WeChatDSHBridge {
       return;
     }
     this.endTyping(user.userId, "agent-error");
+    // The error is the outcome: never follow it with a stale held conclusion.
+    this.dropPendingFinal(agentId);
     void this.sendReply(user.userId, `⚠️ Agent 出错: ${String(error)}`).catch(() => {});
     void this.notifyCrossSessionError(agentId, error);
   }
@@ -1970,11 +2271,18 @@ export class WeChatDSHBridge {
     for (const user of recipients) {
       if (user.sessionId === sessionId) continue;
       if (!this.notifyTaskEventsEnabled()) continue;
-      if (!this.botReady()) continue;
       const set = this.notifiedCrossSessionTurns.get(user.userId) ?? new Set<string>();
       if (set.has(sessionId)) continue;
       set.add(sessionId);
       this.notifiedCrossSessionTurns.set(user.userId, set);
+      // 结论模式: hold instead of one card per auto-continued round.
+      if (this.finalOnlyEnabled()) {
+        this.foldFinalRound(sessionId);
+        this.holdFinalNotice(user.userId, sessionId, body);
+        setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
+        continue;
+      }
+      if (!this.botReady()) continue;
       void this.sendReply(user.userId, body).catch(() => {});
       setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
     }
@@ -2545,7 +2853,7 @@ export class WeChatDSHBridge {
       await this.sendReply(userId, "⚠️ 当前没有活动的会话。");
       return;
     }
-    agent.cancel("user-stop");
+    agent.cancel({ kind: "user" });
     await this.sendReply(userId, "🛑 已发送停止指令。");
   }
 
@@ -3538,6 +3846,10 @@ export class WeChatDSHBridge {
       presetLines.defaultLine,
       // 静默模式 on = we stop forwarding (warning); off = normal delivery (good).
       `• 静默模式: ${this.paintBadge(this.isSilent() ? "on" : "off", this.isSilent() ? "warning" : "positive")}`,
+      // 结论模式 on = per-task hold, only the final conclusion is pushed (good).
+      ...(this.finalOnlyEnabled()
+        ? [`• 结论模式: ${this.paintBadge(`on（暂存 ${this.pendingFinal.size}）`, "positive")}`]
+        : [`• 结论模式: ${this.paintBadge("off", "neutral")}`]),
       `• 微信提示词: ${this.paintBadge(this.config.surfacePromptEnabled ? "on" : "off", this.config.surfacePromptEnabled ? "positive" : "neutral")}`,
       `• 繁忙投递: ${this.ops.busyEnter() === "steer" ? this.paintBadge("steer（插话）", "positive") : this.paintBadge("queue（排队）", "neutral")}`,
       // 跨会话决策推送 on = extra delivery enabled (good); off = quiet (neutral).

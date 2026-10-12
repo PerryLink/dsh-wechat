@@ -24,9 +24,11 @@ Full evidence, including the host-version compatibility matrix: `dsh-plugin-supe
 
 *The same run, animated.*
 
-## Maintenance status: 🧊 FROZEN
+## Maintenance status: 🧊 FROZEN → 🔓 reopened for 结论模式 (2026-10-12)
 
 > **Frozen on 2026-10-05. No new features.** This package still works, and it is not retired — but it no longer receives feature work. Only a genuine breakage will be fixed.
+>
+> **2026-10-12 — the maintainer reopened it for one change.** The per-round WeChat flood (one request → a goal that auto-continues over N rounds → N pushes) has no fix in any released DSH IM bridge, so 结论模式 / final-only was added here (see 功能 below), together with three host-call-shape fixes for DSH 0.2.x. The retirement reasoning and the download comparison below are unchanged history, not a current recommendation.
 
 Maintainers treat this capability as one where **better-adopted alternatives now exist**, so effort has moved elsewhere. The comparison below was measured on 2026-10-05 and is recorded so nobody has to redo it.
 
@@ -57,7 +59,8 @@ Maintainers treat this capability as one where **better-adopted alternatives now
 - **审批/提问卡（双端同卡）** — 微信与 GUI 弹一致的原生审批/提问卡，
   谁先回复谁生效（原生防双决）
 - **微信渠道提示词（动态注入）** — 微信消息注入可配置提示词；GUI 消息时自动消失。设置页可开关/编辑正文，微信 `/surface on|off` 切换
-- **静默模式** — `/silent on` 后每轮只发送最终回复，设置页可切换（全局配置，重新扫码后仍保留）
+- **静默模式** — `/silent on` 后每轮只发送最终回复，设置页可切换（全局配置，重新扫码后仍保留）。⚠️ 单位是**轮**：一次需求若被拆成多轮（例如目标自动续跑 8 轮），仍会收到 8 条
+- **结论模式（只回最终结论）** — 设置页勾选「结论模式」后，跨轮次的中间过程一律暂存，整条任务彻底停下来后**只发一条最终结论**：自动续跑再多轮也只有一条。默认静默 45 秒后交付，最长 10 分钟必发一次；权限卡、提问卡、报错始终立即推送，不受压制；微信发 `/flush` 可随时立即取回。开启后优先于「静默」。配置键 `finalOnly` / `finalOnlyIdleMs` / `finalOnlyCeilingMs`
 - **繁忙时投递（与 DSH 同源）** — 按 `busyEnter` 排队/插话；微信 `/enter` 同步
 - **跨会话决策推送** — `/notify on` 后，任意会话的权限/提问卡整卡推送到微信。当前会话可直接回；其它会话必须 `P{n}=…`（`P1=/rq` 关闭该卡）。默认关。后台任务完成/报错走 `/notify tasks on|off`
 - **二维码登录** — `http://127.0.0.1:3080/wechat/qr` 扫码登录，设置页内嵌
@@ -133,7 +136,7 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 | 命令 | 说明 |
 |---|---|
 | `/help`（`/h`、`/?`） | 帮助 |
-| `/status` | 当前状态：工作区、会话、Agent、待处理(当前)/待处理(跨会话)、当前会话 Preset、模型、上下文、权限、默认 Preset、静默、繁忙投递、跨会话决策推送、任务完成提醒；末尾追加 DSH 通过 `ctx.sessionProjections` 注册的所有会话级状态，分四段显示——`[模式]`（plan / goal / subagent / todos）、`[用量与统计]`（tokenUsage / contextPressure / contextBreakdown / sessionStats / subagentTiming）、`[会话]`（title / sessionListMetadata / permissions / imageLimits）、`[其它]`（未识别 key 自动归类）；DSH 加新 plugin 自动出现 |
+| `/status` | 当前状态：工作区、会话、Agent、待处理(当前)/待处理(跨会话)、当前会话 Preset、模型、上下文、权限、默认 Preset、静默、结论模式、繁忙投递、跨会话决策推送、任务完成提醒；末尾追加 DSH 通过 `ctx.sessionProjections` 注册的所有会话级状态，分四段显示——`[模式]`（plan / goal / subagent / todos）、`[用量与统计]`（tokenUsage / contextPressure / contextBreakdown / sessionStats / subagentTiming）、`[会话]`（title / sessionListMetadata / permissions / imageLimits）、`[其它]`（未识别 key 自动归类）；DSH 加新 plugin 自动出现 |
 | `/workspace (ws) — list \| status \| switch <编号\|路径> \| add <路径>` | 工作区管理（list 显示各工作区会话数，不含已归档；switch/add 回复会写明恢复的会话名字和完整 id，跳过已归档；该目录无可见会话时提示发送消息将创建） |
 | `/session (s) — list [current] \| switch [current] <编号> \| new \| status` | 会话管理（list 最近 20 个，标记当前，不显示 GUI 已归档会话；`list current` 只看当前工作目录，推荐用 `switch current <编号>` 按同一列表切换；紧接着直接 `switch <编号>` 也会复用最近一次列表编号；普通无列表上下文时 `switch <编号>` 对应全量列表；switch 回复同时带会话名字和完整 id；`new` 复用当前工作区空白会话，与 GUI「新建会话」同款，无空白才新建） |
 | `/preset (p) — list \| switch <名称\|编号> \| status` | 默认 Preset（写入 DSH 设置，与 GUI 同步；`status` 看全局默认，不是当前会话；当前会话无内容时 `switch` 立即应用） |
@@ -141,7 +144,8 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 | `/perm — status \| list \| switch <名称\|编号> \| default [名称\|编号]` | 权限管理（switch 实时切当前会话；default 写 DSH 设置，新会话生效） |
 | `/reasoning — [list \| default \| switch <等级>]` | 推理等级：查看当前/默认与模型支持的等级；`switch <等级>` 切换（实时 + 写默认）；`default` 恢复模型默认 |
 | `/enter queue\|steer\|status`（`/busy`） | 繁忙时投递：agent 运行中收到微信消息时排队（`queue`）还是插话进当前轮次（`steer`）；读写 DSH 设置 `ui-conversation.busyEnter`，与 GUI「繁忙时 Enter 键行为」同源同步；空闲会话始终新开一轮 |
-| `/silent on\|off`（`/sl`） | 静默模式：开启后 agent 每轮的中间过程输出（工具调用、思考等）不再逐条推送，只在轮次结束时发送最终回复，避免刷屏；写入 `config.json`，重新扫码后仍保留，设置页可切换 |
+| `/silent on\|off`（`/sl`） | 静默模式：开启后 agent 每轮的中间过程输出（工具调用、思考等）不再逐条推送，只在轮次结束时发送最终回复，避免刷屏；写入 `config.json`，重新扫码后仍保留，设置页可切换。⚠️ 单位是「轮」——一次需求若被拆成多轮（例如目标自动续跑 8 轮），仍会收到 8 条；要按「任务」只收一条请用结论模式 |
+| `/flush`（`/f`） | 立即取回结论模式暂存的最终结论，不必等静默期；没有暂存内容时提示为空 |
 | `/surface on\|off\|status`（`/wxprompt`） | 微信渠道提示词注入开关（默认关）；正文在设置页编辑，不在微信改 |
 | `/notify on\|off\|status`（`/watch`） | 跨会话决策推送总闸（开：任意会话权限/提问卡整卡推送并可直接回复；关：只答当前会话），默认关闭；`/notify tasks on\|off` 单独开关后台任务完成/报错提醒（设置页可切换） |
 | `/history [all] [数量]` | 查看最近历史（默认 5 条，最多 20 条；默认只看你和助手，`all` 含压缩检查点/插件注入等系统消息）；当前可回答的提问/权限卡会完整重发（决策推送开启时含其它会话） |
@@ -178,10 +182,10 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 同款交付），挂载到 `settings.section` slot（nav 顺序 40）：
 
 - **状态卡** — 登录阶段（未登录/等待扫码/已扫码，待确认/已登录/登录失败）、Bot ID、
-  监控运行状态、已绑定用户数，与 `跨会话决策推送` / `任务完成提醒` / `静默` 开关同卡展示
+  监控运行状态、已绑定用户数，与 `跨会话决策推送` / `任务完成提醒` / `静默` / `结论模式` 开关同卡展示
 - **扫码** — 未登录时页面内直接显示二维码，扫码确认后自动进入已登录
 - **操作按钮** — `重新扫码`（清除 token 重新登录）、`退出登录`，与保存配置同行
-- **连接配置** — 设置页只展示 `cwd` / `cardTimeoutMs`，以及 `跨会话决策推送` / `任务完成提醒` / `静默` / 微信渠道提示词（开关 + 正文）；保存即生效。`baseUrl` / `cdnBaseUrl` / `botType` / `textChunkLimit` 仍可写 `~/.dsh-wechat/config.json` 或插件行 `config:`，设置页保存不会覆盖它们。网关参数变更会自动重启长轮询；存储于 `~/.dsh-wechat/config.json` 与 `state.json`
+- **连接配置** — 设置页只展示 `cwd` / `cardTimeoutMs`，以及 `跨会话决策推送` / `任务完成提醒` / `静默` / `结论模式` / 微信渠道提示词（开关 + 正文）；保存即生效。`baseUrl` / `cdnBaseUrl` / `botType` / `textChunkLimit` / `finalOnlyIdleMs` / `finalOnlyCeilingMs` 仍可写 `~/.dsh-wechat/config.json` 或插件行 `config:`，设置页保存不会覆盖它们。网关参数变更会自动重启长轮询；存储于 `~/.dsh-wechat/config.json` 与 `state.json`
 - **帮助** — 卡片标题行的 **帮助** 按钮展开本地命令表（与微信 `/help` 同源）；DSH 原生命令仍只在微信 `/help` 末尾按当前 profile 列出
 
 与宿主通信走插件自己的 HTTP API（`/wechat/api/status|help|config|relogin|
@@ -210,7 +214,10 @@ logout`），客户端零 `@deepseek-ai` 依赖。
 | `cardTimeoutMs` | `1800000` | 提问/权限卡软超时（30 分钟） |
 | `crossSessionNotify` | `false` | 跨会话决策推送总闸（任意会话的权限/提问卡整卡推送，微信直接回复） |
 | `notifyTaskEvents` | `false` | 后台任务完成/报错提醒（独立于决策推送，默认关） |
-| `silent` | `false` | 静默模式总闸（只发每轮最终回复；重新扫码后仍保留） |
+| `silent` | `false` | 静默模式总闸（只发**每轮**最终回复；重新扫码后仍保留） |
+| `finalOnly` | `false` | 结论模式总闸（跨轮次暂存，整条任务停下后只发**一条**最终结论；优先于 `silent`） |
+| `finalOnlyIdleMs` | `45000` | 结论模式静默期：任一活动事件（助手正文、轮次结束、`agent/status` 空闲/运行）都会把它重新推后 |
+| `finalOnlyCeilingMs` | `600000` | 结论模式硬顶：从第一次暂存起算，到时无论是否仍在续跑都强制交付一次（10 分钟） |
 | `surfacePromptEnabled` | `false` | 微信渠道提示词总闸（微信消息驱动时注入，GUI 消息时仍隐藏） |
 | `surfacePrompt` | 见默认中文 | 注入正文（设置页编辑；含 `{{` 会被打散以免打断 DSH interpolate） |
 

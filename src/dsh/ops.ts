@@ -118,9 +118,16 @@ export interface SessionListFacts {
 
 /** Durable projection-cache snapshot used as a zero-I/O listing hint. */
 interface ProjectionCacheService {
+  /**
+   * DSH 0.1.7+ takes an optional projection-key filter as the second
+   * parameter (it is fed to `new Set(keys)`); the pre-0.1.7 signature took an
+   * `inheritedEventCount: number`. Passing `0` therefore throws
+   * `number 0 is not iterable` on every 0.2.x host, which the caller's
+   * try/catch swallowed into a silent loss of the cache hint.
+   */
   cachedSnapshot(
     header: SessionHeader,
-    inheritedEventCount: number,
+    keys?: readonly string[],
   ): { values?: Record<string, unknown> } | undefined;
 }
 
@@ -408,7 +415,7 @@ export class DshOps {
     const cache = this.get<ProjectionCacheService>("sessionProjectionCache");
     if (!cache || typeof cache.cachedSnapshot !== "function") return undefined;
     try {
-      const snap = cache.cachedSnapshot(header, 0);
+      const snap = cache.cachedSnapshot(header);
       const values = snap?.values;
       if (!values) return undefined;
       const hint: SessionListFacts = {};
@@ -759,22 +766,38 @@ export class DshOps {
 
   /**
    * Persist the deployment-wide default preset into the DSH settings document
-   * (`agent-presets` namespace) — the exact document the GUI settings page
-   * edits, so a change from WeChat shows up there and vice versa. Returns
-   * false when no settings provider is mounted or the write is refused.
+   * — the exact document the GUI settings page edits, so a change from WeChat
+   * shows up there and vice versa. Returns false when no settings provider is
+   * mounted or the write is refused.
+   *
+   * The config-row id IS the settings namespace (`settings.update` resolves it
+   * against the profile's loader entries and throws `No configurable plugin
+   * entry` otherwise), and the host renamed both the row and the field at
+   * 0.1.7: `agent-presets` → `agent-preset-registry`, `default` →
+   * `selectedDefault`. Writing the old pair is a silent no-op on every 0.2.x
+   * host, so try the current shape first and keep the 0.1.5 shape as a
+   * fallback rather than dropping the older line.
    */
   async saveDefaultPreset(presetId: string): Promise<boolean> {
     const settings = this.get<{
       update(ns: SettingsNamespace, patch: object): Promise<void>;
     }>("settings");
     if (!settings) return false;
-    try {
-      await settings.update("agent-presets" as SettingsNamespace, { default: presetId });
-      return true;
-    } catch (err) {
-      console.error(`[dsh-wechat] save default preset failed: ${String(err)}`);
-      return false;
+    const attempts: Array<[SettingsNamespace, object]> = [
+      ["agent-preset-registry" as SettingsNamespace, { selectedDefault: presetId }],
+      ["agent-presets" as SettingsNamespace, { default: presetId }],
+    ];
+    let lastError: unknown;
+    for (const [ns, patch] of attempts) {
+      try {
+        await settings.update(ns, patch);
+        return true;
+      } catch (err) {
+        lastError = err;
+      }
     }
+    console.error(`[dsh-wechat] save default preset failed: ${String(lastError)}`);
+    return false;
   }
 
   async recomposeAgent(agentCtx: unknown, id: string): Promise<boolean> {

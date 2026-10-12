@@ -98,6 +98,65 @@ describe("ConfigStore", () => {
     }
   });
 
+  it("persists 结论模式 (finalOnly) as a global boolean", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ finalOnly: true });
+
+      const reloaded = new ConfigStore(dir);
+      expect(reloaded.stored().finalOnly).toBe(true);
+      expect(reloaded.resolve(defaultConfig()).finalOnly).toBe(true);
+
+      store.update({ finalOnly: false });
+      expect(new ConfigStore(dir).stored().finalOnly).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a non-boolean finalOnly", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ finalOnly: "yes" as never });
+      expect(store.stored().finalOnly).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists the finalOnly windows and rejects non-positive or non-numeric values", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ finalOnlyIdleMs: 15_000, finalOnlyCeilingMs: 120_000 });
+      const reloaded = new ConfigStore(dir);
+      expect(reloaded.stored().finalOnlyIdleMs).toBe(15_000);
+      expect(reloaded.stored().finalOnlyCeilingMs).toBe(120_000);
+
+      store.update({
+        finalOnlyIdleMs: 0,
+        finalOnlyCeilingMs: Number.NaN,
+      });
+      expect(new ConfigStore(dir).stored().finalOnlyIdleMs).toBe(15_000);
+      expect(new ConfigStore(dir).stored().finalOnlyCeilingMs).toBe(120_000);
+
+      store.update({ finalOnlyIdleMs: "60000" as never, finalOnlyCeilingMs: -1 });
+      expect(new ConfigStore(dir).stored().finalOnlyIdleMs).toBe(15_000);
+      expect(new ConfigStore(dir).stored().finalOnlyCeilingMs).toBe(120_000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults 结论模式 to off with a 45s settle window and a 10min ceiling", () => {
+    const cfg = defaultConfig();
+    expect(cfg.finalOnly).toBe(false);
+    expect(cfg.finalOnlyIdleMs).toBe(45_000);
+    expect(cfg.finalOnlyCeilingMs).toBe(600_000);
+  });
+
   it("persists surfacePromptEnabled and surfacePrompt", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
     try {
