@@ -50,6 +50,21 @@ export interface WeChatDSHConfig {
   surfacePromptEnabled: boolean;
   /** Runtime-context text injected for WeChat-driven turns (edited from the settings page). */
   surfacePrompt: string;
+  /**
+   * Per-minute cap on agent-initiated `send_wechat` pushes. `0` disables the
+   * cap. A runaway agent loop can otherwise spend the whole 10-message
+   * gateway window on narration and leave no room for the answer; at the cap
+   * the tool returns `ok:false` so the model stops pushing instead of the
+   * bridge silently dropping what it sent.
+   */
+  sendWechatRateLimitPerMinute: number;
+  /**
+   * Inbound allowlist of WeChat user ids. EMPTY (the default) keeps the
+   * historical single-peer behaviour: the first inbound user becomes the
+   * bound peer. Non-empty means only those ids are processed — anyone else
+   * is ignored with a log line, never answered.
+   */
+  allowedUsers: string[];
 }
 
 /** Default WeChat surface prompt — injected as a runtime-context snapshot. */
@@ -88,5 +103,7 @@ export function defaultConfig(): WeChatDSHConfig {
     finalOnlyCeilingMs: 10 * 60_000,
     surfacePromptEnabled: false,
     surfacePrompt: DEFAULT_SURFACE_PROMPT,
+    sendWechatRateLimitPerMinute: 10,
+    allowedUsers: [],
   };
 }

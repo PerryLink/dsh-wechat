@@ -17,7 +17,7 @@
  * - `/flush` delivers immediately, and is a bypass command
  * - approvals / questions are never held (they are answerable, not narration)
  * - an agent error drops the hold instead of following it with a stale digest
- * - stop() / re-bind discard the hold without delivering
+ * - stop() DELIVERS the hold (dispose is not a peer rebind); re-bind discards
  * - cross-session task notices collapse to one message as well
  */
 
@@ -311,13 +311,17 @@ describe("结论模式: cross-session notices", () => {
 });
 
 describe("结论模式: lifecycle hygiene", () => {
-  it("stop() discards the hold without delivering", async () => {
+  it("stop() DELIVERS the hold (plugin dispose is not a peer rebind)", async () => {
+    // The hold is a conclusion the agent already produced. Plugin dispose /
+    // host shutdown does not change who the WeChat peer is, so destroying
+    // the answer would lose the task's only output; only logout / re-login /
+    // re-bind (resetPeerBinding, discardQueuedOutbound) may discard it.
     const bridge = makeBridge({ finalOnlyIdleMs: 60_000 });
-    goalRound(bridge, 1, "不该在停用后发出");
+    goalRound(bridge, 1, "停用前必须发出");
     await bridge.stop();
     await flushTicks();
     await sleep(30);
-    expect(texts().some((t) => t.includes("不该在停用后发出"))).toBe(false);
+    expect(texts().some((t) => t.includes("停用前必须发出"))).toBe(true);
   });
 
   it("re-binding the peer discards the hold", async () => {

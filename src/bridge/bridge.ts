@@ -47,6 +47,7 @@ import {
 } from "../state.js";
 import type { WeChatDSHConfig } from "../config.js";
 import { EDITABLE_KEYS, type ConfigStore, type EditableConfig } from "../config-store.js";
+import { maskSecrets } from "../utils/redact.js";
 import {
   detectUnknownSlashCommand,
   formatHelp,
@@ -92,6 +93,13 @@ import {
 /** WeChat gateway continuous-message limit per user interaction window. */
 const MSG_LIMIT_MAX = 10;
 const MSG_LIMIT_WARN = 7;
+/**
+ * Code points of an assistant message quoted in a cross-session notice.
+ * The CONCLUSION lives at the END of an assistant message, so the quote is
+ * taken from the tail: a head excerpt shows the preamble ("let me look at
+ * the file…") in exactly the case the notice exists to summarise.
+ */
+const PREVIEW_CHARS = 80;
 /** Bound memory for service-identified inbound replays; equal text is never a key. */
 const INBOUND_TTL_MS = 30 * 60_000;
 const INBOUND_MAX_SEEN = 4096;
@@ -277,6 +285,81 @@ export interface NativeCommandsSurface {
 
 type CachedMessage = OutboundMessage;
 
+/**
+ * The LAST `count` code points of `text`, plus whether anything was cut.
+ *
+ * "Last N characters" cannot be `slice(-N)`: that counts UTF-16 units, so
+ * a tail beginning with an astral character (most emoji) starts on a lone
+ * low surrogate. WeChat shows that as U+FFFD, and the excerpt would be
+ * visibly corrupted at exactly the boundary this helper exists to pick.
+ * The walk runs backwards from the end, so a multi-kilobyte message costs
+ * nothing beyond the code points actually kept.
+ *
+ * The `truncated` flag is returned rather than inferred by the caller:
+ * `tail.length < text.length` compares code points against UTF-16 units and
+ * turns false the moment the message contains an emoji, silently dropping
+ * the ellipsis that tells the reader the quote is partial.
+ */
+function tailByCodePoint(text: string, count: number): { tail: string; truncated: boolean } {
+  if (count <= 0) return { tail: "", truncated: text.length > 0 };
+  let start = text.length;
+  let taken = 0;
+  while (start > 0 && taken < count) {
+    const code = text.charCodeAt(start - 1);
+    const high = start >= 2 ? text.charCodeAt(start - 2) : 0;
+    if (code >= 0xdc00 && code <= 0xdfff && high >= 0xd800 && high <= 0xdbff) {
+      start -= 2;
+    } else {
+      start -= 1;
+    }
+    taken += 1;
+  }
+  return { tail: text.slice(start), truncated: start > 0 };
+}
+
+/**
+ * Sliding 60-second limiter for agent-initiated `send_wechat` pushes.
+ *
+ * A sliding window, not a fixed bucket: a bucket would let 2× the limit
+ * through across a bucket boundary, and the thing being protected is
+ * WeChat's own 10-message gateway window, which is also a rolling window.
+ * Timestamps of ACCEPTED pushes only — a refused call must not extend the
+ * window, or the model could keep the limiter tripped forever by retrying.
+ */
+class PushRateWindow {
+  private readonly accepted: number[] = [];
+  private static readonly WINDOW_MS = 60_000;
+
+  private prune(now: number): void {
+    const cutoff = now - PushRateWindow.WINDOW_MS;
+    while (this.accepted.length > 0 && this.accepted[0]! <= cutoff) this.accepted.shift();
+  }
+
+  /** Accepted pushes inside the current window. */
+  count(): number {
+    this.prune(Date.now());
+    return this.accepted.length;
+  }
+
+  /** Record one push; false when the window is full (`limit` ≤ 0 = unlimited). */
+  accept(limit: number): boolean {
+    if (!Number.isFinite(limit) || limit <= 0) return true;
+    const now = Date.now();
+    this.prune(now);
+    if (this.accepted.length >= Math.floor(limit)) return false;
+    this.accepted.push(now);
+    return true;
+  }
+
+  /** Whole seconds until the oldest accepted push leaves the window. */
+  retryAfterSeconds(): number {
+    this.prune(Date.now());
+    const oldest = this.accepted[0];
+    if (oldest === undefined) return 0;
+    return Math.max(1, Math.ceil((oldest + PushRateWindow.WINDOW_MS - Date.now()) / 1000));
+  }
+}
+
 export class WeChatDSHBridge {
   private readonly ctx: BridgeContext;
   private config: WeChatDSHConfig;
@@ -361,6 +444,12 @@ export class WeChatDSHBridge {
   private outboundCache: CachedMessage[] = [];
   private wechatMsgCount = 0;
   private cacheNoticeSent = false;
+  /** Sliding-window limiter for agent-initiated `send_wechat` pushes. */
+  private readonly pushRate = new PushRateWindow();
+  /** Reentrancy guard for the cap-pressure force-send in `parkOutbound`. */
+  private capFlushActive = false;
+  /** Force-sends performed at the cap (log throttle only). */
+  private capFlushes = 0;
   /** Serializes all outbound budget/queue mutations across assistant and tool sends. */
   private outboundSerial: Promise<void> = Promise.resolve();
   /** Per-agent model overrides set by `/model switch` / `/reasoning` (applied via agent/request). */
@@ -612,7 +701,7 @@ export class WeChatDSHBridge {
     } catch (err) {
       console.warn(`[dsh-wechat] native command ${name} threw: ${String(err)}`);
       const detail = err instanceof Error ? err.message : String(err);
-      await this.sendReply(userId, `⚠️ 命令执行异常：${detail}`);
+      await this.sendReply(userId, `⚠️ 命令执行异常：${maskSecrets(detail)}`);
       return true;
     }
     if (result === undefined) return false;
@@ -924,8 +1013,20 @@ export class WeChatDSHBridge {
     this.silentBuffers.clear();
     this.seenOutputEvents.clear();
     this.outboundGeneration++;
-    // Held conclusions die with the plugin: nothing is delivered on dispose.
-    this.discardPendingFinal();
+    // A hold is a conclusion the agent ALREADY produced. Plugin dispose /
+    // host shutdown is not a rebind: the peer is still the same WeChat user
+    // and the answer is still wanted, so it is delivered rather than
+    // destroyed. This runs BEFORE `monitorTask` is awaited, while the token
+    // and the gateway cursors are still live.
+    //
+    // The contrast is `resetPeerBinding()` / `discardQueuedOutbound()`
+    // (logout, re-login, peer re-bind): there the identity is changing, so a
+    // held conclusion belongs to a peer we no longer serve and must NOT be
+    // delivered to whoever binds next.
+    //
+    // `flushPendingFinal` already swallows a send failure per session, so a
+    // broken gateway cannot turn dispose into a rejection.
+    await this.flushAllPendingFinal("dispose");
     await this.monitorTask;
   }
 
@@ -1220,6 +1321,17 @@ export class WeChatDSHBridge {
 
   private async handleMessage(msg: WeixinMessage): Promise<void> {
     if (this.interactionStopped || msg.message_type !== MessageType.USER || msg.group_id || !msg.from_user_id) return;
+    // Inbound allowlist, BEFORE dedupe, budget reset, session creation and any
+    // command handling: a rejected sender must not consume a dedupe slot, a
+    // session, or an agent turn. An empty list is the historical behaviour
+    // (first inbound user becomes the peer), so this is opt-in only.
+    const allowed = this.config.allowedUsers;
+    if (allowed.length > 0 && !allowed.some((id) => id === msg.from_user_id)) {
+      // Logged, never answered: replying would confirm the bot is live to an
+      // unknown sender and spend a gateway message doing it.
+      this.log(`ignore inbound from ${msg.from_user_id}: not in allowedUsers`);
+      return;
+    }
     if (this.peerUserId && this.peerUserId !== msg.from_user_id) return;
     const key = this.inboundKey(msg);
     const now = Date.now();
@@ -1651,8 +1763,7 @@ export class WeChatDSHBridge {
           if (r.userId === user.userId) continue;
           if (!this.notifyTaskEventsEnabled()) continue;
           const ctx = await this.sessionContextLabel(sessionId);
-          const preview = this.lastAssistantTextBySession.get(sessionId);
-          const suffix = preview ? "\n> " + preview.slice(0, 80) + (preview.length > 80 ? "…" : "") : "";
+          const suffix = this.previewSuffix(sessionId);
           const body = ctx + "\n✅ 任务已完成" + suffix + "\n发送 /session switch <编号> 切换查看。";
           const set = this.notifiedCrossSessionTurns.get(r.userId) ?? new Set<string>();
           if (set.has(sessionId)) continue;
@@ -2047,7 +2158,11 @@ export class WeChatDSHBridge {
     this.endTyping(user.userId, "agent-error");
     // The error is the outcome: never follow it with a stale held conclusion.
     this.dropPendingFinal(agentId);
-    void this.sendReply(user.userId, `⚠️ Agent 出错: ${String(error)}`).catch(() => {});
+    // Error text is untrusted prose: a failing request often quotes the
+    // Authorization header or an API key back at us. Mask before it
+    // crosses into WeChat (the one place assistant-visible text is not
+    // masked — see `maskSecrets`).
+    void this.sendReply(user.userId, `⚠️ Agent 出错: ${maskSecrets(String(error))}`).catch(() => {});
     void this.notifyCrossSessionError(agentId, error);
   }
 
@@ -2404,6 +2519,26 @@ export class WeChatDSHBridge {
   }
 
   /**
+   * Block-quoted preview of a session's last assistant text for a
+   * cross-session notice, or "" when there is nothing to quote.
+   *
+   * Two deliberate properties:
+   *   - the TAIL, not the head — an assistant message opens with preamble
+   *     and closes with the conclusion, and the notice exists to convey
+   *     the conclusion;
+   *   - `maskSecrets` — assistant prose can echo a token or hash it was
+   *     shown. Only this excerpt is masked; a normal reply body never is
+   *     (the mask's hex/base64 rules would eat its commit SHAs).
+   * Measured in code points, so a tail of emoji is not half a surrogate.
+   */
+  private previewSuffix(sessionId: string): string {
+    const preview = this.lastAssistantTextBySession.get(sessionId);
+    if (!preview) return "";
+    const { tail, truncated } = tailByCodePoint(preview, PREVIEW_CHARS);
+    return `\n> ${maskSecrets(tail)}${truncated ? "…" : ""}`;
+  }
+
+  /**
    * Send one mirrored approval card with its session provenance header.
    * The P{n} number is the card's index across answerable approvals
    * (current session, plus other sessions while the decision gate is on).
@@ -2485,8 +2620,7 @@ export class WeChatDSHBridge {
     const recipients = await this.resolveCrossSessionRecipients(sessionId);
     if (recipients.length === 0) return;
     const context = await this.sessionContextLabel(sessionId);
-    const preview = this.lastAssistantTextBySession.get(sessionId);
-    const previewSuffix = preview ? "\n> " + preview.slice(0, 80) + (preview.length > 80 ? "…" : "") : "";
+    const previewSuffix = this.previewSuffix(sessionId);
     const body = context + "\n✅ 任务已完成" + previewSuffix + "\n发送 /session switch <编号> 切换查看。";
     for (const user of recipients) {
       if (user.sessionId === sessionId) continue;
@@ -2513,7 +2647,9 @@ export class WeChatDSHBridge {
     const recipients = await this.resolveCrossSessionRecipients(sessionId);
     if (recipients.length === 0) return;
     const context = await this.sessionContextLabel(sessionId);
-    const msg = String(error).slice(0, 200);
+    // Same reasoning as the bound-user path: exception text is the one
+    // outbound body that routinely carries credentials, so it is masked.
+    const msg = maskSecrets(String(error)).slice(0, 200);
     const body = context + "\n⚠️ 任务报错: " + msg + "\n发送 /session switch <编号> 查看。";
     for (const user of recipients) {
       if (user.sessionId === sessionId) continue;
@@ -3662,7 +3798,7 @@ export class WeChatDSHBridge {
       });
     } catch (err) {
       console.warn(`[dsh-wechat] getSessionHistory failed: ${String(err)}`);
-      await this.sendReply(userId, `⚠️ 读取历史失败：${String(err)}`);
+      await this.sendReply(userId, `⚠️ 读取历史失败：${maskSecrets(String(err))}`);
       return;
     }
     if (entries.length === 0) {
@@ -3899,7 +4035,7 @@ export class WeChatDSHBridge {
         try {
           service.set(agent.session, name);
         } catch (err) {
-          await this.sendReply(userId, `⚠️ 切换权限失败: ${String(err)}`);
+          await this.sendReply(userId, `⚠️ 切换权限失败: ${maskSecrets(String(err))}`);
           return;
         }
         const lines = [`✅ 当前会话权限已切换: ${this.describePermission(service, name)}`];
@@ -4276,6 +4412,25 @@ export class WeChatDSHBridge {
       return { ok: false, message: "WeChat bot token is invalid; re-scan the QR code" };
     }
 
+    // Rate limit BEFORE the send. This is the agent-initiated path only —
+    // assistant replies are the user's own answer and must never be gated
+    // here. Refusing loudly (ok:false) is the point: a silent send would let
+    // a loop keep pushing until WeChat's 10-message window is spent on
+    // narration, and the model would never learn to stop.
+    const limitPerMinute = this.config.sendWechatRateLimitPerMinute;
+    if (!this.pushRate.accept(limitPerMinute)) {
+      const waitSeconds = this.pushRate.retryAfterSeconds();
+      this.log(`send_wechat refused: ${this.pushRate.count()} push(es) in the last minute (limit ${limitPerMinute})`);
+      return {
+        ok: false,
+        message:
+          `rate limited: ${this.pushRate.count()} send_wechat push(es) in the last 60s (limit ${limitPerMinute}/min). `
+          + `Do NOT keep pushing — finish the task and put the result in your normal reply`
+          + (waitSeconds > 0 ? `; the next push is accepted in ~${waitSeconds}s` : "")
+          + ".",
+      };
+    }
+
     if (args.file_path) {
       const filePath = args.file_path;
       const fileName = filePath.split(/[\\/]/).pop() ?? "file";
@@ -4351,7 +4506,7 @@ export class WeChatDSHBridge {
     if (this.tokenInvalid) {
       this.logDropOutbound(item.kind === "text" ? item.text.slice(0, 60) : item.fileName);
       if (!parkOnError) return "failed";
-      this.parkOutbound(userId, item);
+      await this.parkOutbound(userId, item);
       return "cached";
     }
 
@@ -4369,13 +4524,13 @@ export class WeChatDSHBridge {
     if (generation !== this.outboundGeneration) return "failed";
     // Payloads behind a failed / rate-limited item must not overtake it.
     if (parkOnError && this.outboundCache.length > 0) {
-      this.parkOutbound(userId, item);
+      await this.parkOutbound(userId, item);
       return "cached";
     }
     const count = this.wechatMsgCount;
     if (count >= MSG_LIMIT_MAX) {
       if (!parkOnError) return "failed";
-      this.parkOutbound(userId, item);
+      await this.parkOutbound(userId, item);
       // No notice here: an 11th direct send would hit the same closed window.
       return "cached";
     }
@@ -4410,7 +4565,7 @@ export class WeChatDSHBridge {
       if (isMessageLimitError(err)) {
         this.wechatMsgCount = MSG_LIMIT_MAX;
         if (!parkOnError) return "failed";
-        this.parkOutbound(userId, item);
+        await this.parkOutbound(userId, item);
         return "cached";
       }
       if (isInvalidRequestError(err)) {
@@ -4421,7 +4576,7 @@ export class WeChatDSHBridge {
         this.markTokenInvalid();
         this.logDropOutbound(item.kind === "text" ? item.text.slice(0, 60) : item.fileName);
         if (!parkOnError) return "failed";
-        this.parkOutbound(userId, item);
+        await this.parkOutbound(userId, item);
         return "cached";
       }
       // Logout/re-login may abort an in-flight send. Never carry that text
@@ -4434,20 +4589,47 @@ export class WeChatDSHBridge {
         this.log(`drop outbound (control reply, not queued): ${item.kind === "text" ? item.text.slice(0, 60) : item.fileName}`);
         return "failed";
       }
-      this.parkOutbound(userId, item);
+      await this.parkOutbound(userId, item);
       await this.notifyCachePendingLocked(userId);
       return "cached";
     }
   }
 
-  /** Append to the one durable FIFO, dropping oldest items above the hard cap. */
-  private parkOutbound(userId: string, item: CachedMessage): void {
-    this.outboundCache.push({ ...item });
-    if (this.outboundCache.length > MAX_OUTBOUND_QUEUE) {
-      const overflow = this.outboundCache.length - MAX_OUTBOUND_QUEUE;
-      this.outboundCache.splice(0, overflow);
-      this.log(`outbound cache cap (${MAX_OUTBOUND_QUEUE}) exceeded; dropped ${overflow} oldest item(s)`);
+  /**
+   * Append to the one durable FIFO. At the hard cap the oldest item is
+   * FORCE-SENT instead of dropped.
+   *
+   * The cap exists to bound memory, but the queue's contents are exactly
+   * what must not vanish: notifications, task conclusions, tool pushes. So
+   * reaching the cap means "try harder", not "discard": one item leaves the
+   * queue by being delivered. The only way it is still lost is if that send
+   * itself fails, and `deliverOutboundLocked` then appends it again (there
+   * is room, one slot was just freed) so nothing is destroyed silently.
+   */
+  private async parkOutbound(userId: string, item: CachedMessage): Promise<void> {
+    // `capFlushActive` breaks the reentrancy: a failed force-send parks its
+    // item again, and without the flag that park would ask for another
+    // force-send, which fails again — an unbounded loop that never returns
+    // to the caller waiting on `deliverOutbound`.
+    if (this.outboundCache.length >= MAX_OUTBOUND_QUEUE && !this.capFlushActive) {
+      const oldest = this.outboundCache[0];
+      const label = oldest === undefined
+        ? "(none)"
+        : oldest.kind === "text" ? oldest.text.slice(0, 60) : oldest.fileName;
+      // One line per force-send would flood the log when the queue sits at
+      // the cap for a long time; report first entry and then every 50th.
+      if (this.capFlushes === 0 || this.capFlushes % 50 === 0) {
+        this.log(`outbound cache cap (${MAX_OUTBOUND_QUEUE}) reached; force-sending oldest instead of dropping it: ${label}${this.capFlushes > 0 ? ` (${this.capFlushes} force-sent so far)` : ""}`);
+      }
+      this.capFlushes++;
+      this.capFlushActive = true;
+      try {
+        await this.flushPending(userId, { silent: true, force: true });
+      } finally {
+        this.capFlushActive = false;
+      }
     }
+    this.outboundCache.push({ ...item });
     this.persistOutboundState(userId);
   }
 
@@ -4504,11 +4686,11 @@ export class WeChatDSHBridge {
   }
 
   /** Flush the one FIFO (/next, next inbound, or -14 recovery). */
-  private flushPending(userId: string, opts?: { silent?: boolean }): Promise<void> {
+  private flushPending(userId: string, opts?: { silent?: boolean; force?: boolean }): Promise<void> {
     return this.serializeOutbound(() => this.flushPendingLocked(userId, opts));
   }
 
-  private async flushPendingLocked(userId: string, opts?: { silent?: boolean }): Promise<void> {
+  private async flushPendingLocked(userId: string, opts?: { silent?: boolean; force?: boolean }): Promise<void> {
     if (this.outboundCache.length === 0) {
       if (!opts?.silent) {
         await this.deliverOutboundLocked(userId, { kind: "text", text: "✅ 没有缓存的消息。" }, { parkOnError: false });
@@ -4528,7 +4710,14 @@ export class WeChatDSHBridge {
 
     for (let index = 0; index < cache.length; index++) {
       const msg = cache[index]!;
-      if (!this.token || this.tokenGiveUp || this.tokenInvalid || this.wechatMsgCount >= MSG_LIMIT_MAX) break;
+      if (!this.token || this.tokenGiveUp || this.tokenInvalid) break;
+      // `force` (the cap-pressure flush) sends exactly ONE item past the
+      // closed 10-message window: dropping is the one outcome the cap must
+      // never produce, and the gateway is the authority on whether the
+      // window is really closed. Bounded to the first iteration so a park
+      // does not drain the whole 100-item cache into a closed window.
+      const forced = opts?.force === true && index === 0;
+      if (this.wechatMsgCount >= MSG_LIMIT_MAX && !forced) break;
       const token = this.token;
       this.wechatMsgCount++;
       this.persistOutboundState(userId);

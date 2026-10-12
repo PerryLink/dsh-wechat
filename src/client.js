@@ -404,12 +404,21 @@ window.__ModuleLoader__.load({
 		}
 
 		function apply(ctx) {
-			ctx.slots.inject("settings.section", () => ctx.slots.register({
+			// Park the registration on the plugin's fiber. `slots.inject`
+			// returns a disposer; dropping it leaves the WeChat panel
+			// registered after the plugin is unloaded (and re-registering on
+			// the next load stacks a duplicate entry). `ctx.effect` is the
+			// documented owner for exactly this (see ui-sidebar-terminal /
+			// ui-sidebar-files), with the plain call kept as a fallback for a
+			// client kernel that predates it.
+			const register = () => ctx.slots.inject("settings.section", () => ctx.slots.register({
 				name: "settings.section",
 				id: "wechat",
 				order: 40,
 				label: "WeChat",
 			}, WechatSection));
+			if (ctx.effect) ctx.effect(register);
+			else register();
 		}
 
 		exports.apply = apply;

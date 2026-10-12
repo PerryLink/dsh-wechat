@@ -228,4 +228,94 @@ describe("ConfigStore", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("persists sendWechatRateLimitPerMinute and accepts 0 as 'unlimited'", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ sendWechatRateLimitPerMinute: 25 });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(25);
+
+      store.update({ sendWechatRateLimitPerMinute: 0 });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(0);
+
+      const reloaded = new ConfigStore(dir);
+      expect(reloaded.resolve(defaultConfig()).sendWechatRateLimitPerMinute).toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a non-finite or negative rate limit", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ sendWechatRateLimitPerMinute: 7 });
+      // A negative limit would refuse EVERY push, so it is not a valid "off".
+      store.update({ sendWechatRateLimitPerMinute: -1 });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(7);
+      store.update({ sendWechatRateLimitPerMinute: Number.NaN });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(7);
+      store.update({ sendWechatRateLimitPerMinute: Number.POSITIVE_INFINITY });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(7);
+      store.update({ sendWechatRateLimitPerMinute: "10" as never });
+      expect(new ConfigStore(dir).stored().sendWechatRateLimitPerMinute).toBe(7);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists allowedUsers as an array of strings", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ allowedUsers: ["wxid_a", "wxid_b"] });
+      expect(new ConfigStore(dir).stored().allowedUsers).toEqual(["wxid_a", "wxid_b"]);
+      expect(new ConfigStore(dir).resolve(defaultConfig()).allowedUsers).toEqual(["wxid_a", "wxid_b"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a non-array or non-string-membered allowedUsers", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      const store = new ConfigStore(dir);
+      store.update({ allowedUsers: ["wxid_ok"] });
+      // A stored list containing a non-string would look non-empty (so the
+      // first-user fallback is off) while never matching anyone.
+      store.update({ allowedUsers: ["wxid_ok", 42] as never });
+      expect(new ConfigStore(dir).stored().allowedUsers).toEqual(["wxid_ok"]);
+      store.update({ allowedUsers: "wxid_ok" as never });
+      expect(new ConfigStore(dir).stored().allowedUsers).toEqual(["wxid_ok"]);
+      store.update({ allowedUsers: { 0: "wxid_ok" } as never });
+      expect(new ConfigStore(dir).stored().allowedUsers).toEqual(["wxid_ok"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitises a hand-edited allowedUsers read straight from config.json", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-cfg-"));
+    try {
+      fs.writeFileSync(
+        path.join(dir, "config.json"),
+        JSON.stringify({ allowedUsers: ["wxid_ok", 7, null] }),
+        "utf-8",
+      );
+      const store = new ConfigStore(dir);
+      expect(store.stored().allowedUsers).toEqual(["wxid_ok"]);
+
+      fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ allowedUsers: "nope" }), "utf-8");
+      expect(new ConfigStore(dir).stored().allowedUsers).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults the push governance switches to off / empty", () => {
+    const cfg = defaultConfig();
+    expect(cfg.sendWechatRateLimitPerMinute).toBe(10);
+    expect(cfg.allowedUsers).toEqual([]);
+  });
 });
