@@ -60,6 +60,50 @@
 
 - The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
 
+## [0.9.11] - 2026-10-07
+
+### Fixed
+
+- 修复微信 `/preset switch` 无法写入 DSH 0.2 设置的问题：根据设置服务公布的命名空间写入 `agent-preset-registry.selectedDefault`，与 GUI 的默认 Preset 选择同步；保留旧版 `agent-presets.default` 接口兼容。
+- 设置写入失败时明确提示「默认 Preset 切换失败，默认 Preset 未更改」，不再误报「已切换」或「仅本次进程内生效」，也不会继续修改空白会话的 Preset。
+- 新增 Preset 切换回归测试，覆盖新版与旧版设置接口、新会话默认值、空白与已有内容会话，以及设置服务缺失和拒绝写入的情况。
+
+## [0.9.10] - 2026-10-07
+
+> 0.9.8、0.9.9 未发布到 npm，本次一并发布，变更合并记录于此。
+
+### Added
+
+- 非静默模式将思考与工具合并为过程分组消息，内容采用桌面端收起条目的规则：中文工具标题、思考首行、路径/描述、任务清单完成计数与变更；成功结果正文隐藏，失败仅显示一行错误。分组标题按类别汇总（如 `已读取文件并执行了命令`），并带 emoji（`⚙️ 🧠 📄 🔍 💻 🌐 📝 ✏️ 📋 ❓ 🤝`，失败为 `❌`）。
+
+### Changed
+
+- `engines.dsh` 由精确匹配 `0.2.0-rc.2` 改为 `>=0.2.0-rc.2`，允许在更高版本的 DSH 上安装；低于该版本的 DSH 仍会被拒绝安装。
+- 出站文本改为官方微信渠道（[Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)）的 `StreamingMarkdownFilter` 语义，不再一律剥掉 Markdown 标记：微信能渲染的语法（`**粗体**`、链接、H1–H4 标题、代码块、行内代码、`>` 引用、`---` 分隔线、表格）原样发送，只移除图片（整段）与 H5/H6 标记，并去掉包裹中文的 `*`/`_`/`***`/`___` 强调标记（内容保留）。
+- 微信渠道提示词默认值去掉「纯文本」要求，改为「支持简单的 Markdown」；设置页已保存过旧正文的用户仍使用自己的值，可在设置页改回默认文案。
+- 「任务完成提醒」改名为「跨会话任务完成提醒」（设置页、`/status`、`/notify` 输出、`/help` 同步），并去掉 `/notify` 帮助与设置页提示里多余的后台任务说明。
+- 「跨会话决策推送」设置页提示去掉「后台任务完成 / 报错请用旁边的…」一句。
+
+### Fixed
+
+- 修复过程推送实际仍在正文结束后才发送的问题。DSH 为**每一帧**（start、每个 chunk、end）分配新的 `revision`，而旧代码要求 chunk 的 `revision` 与 start 帧相等，导致真实运行时所有流式 chunk 被丢弃，只能等 `assistant/message` 提交后才发送过程。现改为「`revision` 必须严格大于上一次处理过的值」，收到下一段正文的首个有效片段即发送待发过程，正文提交后单独发送。
+- 补齐过程分组标题、思考及各类工具条目的 emoji。
+- 流式思考与提交消息去重，不再重复推送同一段思考。
+- 保持过程、正文及长消息分段的发送顺序：失败或限流时后续消息追加到 FIFO 缓存而不越过未发送的过程分组；退出登录、切换会话、静默开关与插件停止都会清理未发送的过程和流状态。
+- 测试改用真实递增 revision 序列，并新增回归用例（此前用例统一传 `revision: 0`，掩盖了流式帧被丢弃的缺陷）。
+
+## [0.9.7] - 2026-10-06
+
+### Changed
+
+- `engines.dsh` 改为精确匹配 `0.2.0-rc.2`，安装兼容性限定为当前桌面版 DSH 版本。
+
+### Fixed
+
+- 修复同一条微信入站消息重复投递、并发创建多个 DSH 会话的问题（#9）。按用户与有效服务端 `message_id` / `seq` 去重，同一用户的会话检查与创建串行执行；相同文本但不同消息身份及无有效身份的消息仍正常处理。
+- 停止/重连将取消进行中的长轮询，丢弃旧轮询迟到的消息；重连等待旧轮询结束后只启动一个新轮询。插件停止后，尚在等待会话创建或媒体转换的消息不再启动推理。
+- 修复 DSH 0.2 设置服务不再提供 `get()` 时，微信 `/status` 和实际繁忙投递错误回落到排队的问题。改为从 `describe()` 读取 `ui-conversation` 的当前生效值，桌面版插话/排队设置与微信同步。
+
 ## [0.9.6] - 2026-09-10
 
 ### Changed

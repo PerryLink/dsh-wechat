@@ -66,6 +66,14 @@ export function apply(ctx: unknown, rawConfig: PluginConfig = {}): () => Promise
     bridge.handleSessionEvent(sessionId, event as { type: string; [k: string]: unknown });
   });
   console.log("[dsh-wechat] session/event listener attached");
+  context.on("agent/assistant-stream", (payload) => {
+    const { agent, frame } = payload as { agent?: { id?: string }; frame?: import("./dsh/types.js").AssistantStreamFrame };
+    if (agent?.id && frame) bridge.handleAssistantStream(agent.id, frame);
+  });
+  context.on("session/disposed", (session) => {
+    const sessionId = sessionIdFrom(session);
+    if (sessionId) bridge.clearSessionOutput(sessionId);
+  });
 
   // ─── Agent idleness → 结论模式 (final-only) quiescence ───
   // The goal round-driver wakes the NEXT round exactly when `agent.status`
