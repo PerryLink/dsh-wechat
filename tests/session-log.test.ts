@@ -379,9 +379,29 @@ describe("session-log: host encodeSegment parity", () => {
   it("sessionLogPath uses the host encoding for the session directory", () => {
     const cwd = "C:\\work";
     const sessionId = "s~1!";
-    const built = log.sessionLogPath(cwd, sessionId, "C:\\home\\.dsh");
+    const root = "C:\\home\\.dsh";
+    const built = log.sessionLogPath(cwd, sessionId, root);
     expect(path.basename(path.dirname(built))).toBe("s~007E1~0021");
-    expect(built.startsWith(path.join("C:\\home\\.dsh", "sessions"))).toBe(true);
+    // Compare against the root the implementation ACTUALLY uses, not the raw
+    // literal: `sessionLogPath` runs its root through `resolveDshHome`, which
+    // makes it absolute. On POSIX a Windows-shaped literal is a RELATIVE path,
+    // so it resolves under the cwd and the literal is not a prefix of the
+    // result — asserting on it passed only on Windows and failed CI (Linux).
+    expect(built.startsWith(path.join(log.resolveDshHome(root), "sessions"))).toBe(true);
+  });
+
+  it("sessionLogPath places the log under a platform-native root", () => {
+    // The shape that exists in production: `resolveDshHome()` returns an
+    // absolute, platform-native directory. This must hold on every OS, which
+    // is what the Windows-only literal above could not prove.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-home-slog-path-"));
+    try {
+      const built = log.sessionLogPath("C:\\work", "s~1!", root);
+      expect(built.startsWith(path.join(root, "sessions"))).toBe(true);
+      expect(path.basename(path.dirname(built))).toBe("s~007E1~0021");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

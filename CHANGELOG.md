@@ -58,6 +58,9 @@
 - **机器人离线期间，跨会话完成通知会被永久压制**：两处完成通知路径把 `if (!this.botReady()) continue;` 放在 `set.add(sessionId)` **之后**，于是不可达时该会话已被标记为「本回合已通知」，且**清理定时器也没挂上**；token 恢复后同一会话再结束，通知再也发不出去。现改为「立即发送路径先确认可达再占用去重位；结论模式暂存路径照常标记（其投递本就要经 `sendReply` 排队，离线暂存正是它能活下来的原因）」，并且**凡标记必挂 30 秒清理定时器**，杜绝无定时器的悬挂标记。
 - 移除只写不读的死代码 `currentGoalRound`（全仓无任何读取，投递决策实际由内联的 `source.kind` 判断完成）。
 
+- **`tests/session-log.test.ts` 的 `sessionLogPath` 断言只在 Windows 成立，导致 CI 在 Linux 上失败**：该用例把 Windows 形状的字面量 `C:\home\.dsh` 同时当作输入与期望前缀，但 `sessionLogPath` 会先把根目录过一遍 `resolveDshHome`（内含 `path.resolve`）。在 POSIX 上 `C:\home\.dsh` 是**相对**路径，会被解析到当前工作目录之下，于是字面量不再是结果的合法前缀，断言必然为假——这是**测试自身的缺陷，不是 `session-log.cjs` 的缺陷**（该文件的实现未改动）。现改为与 `resolveDshHome(root)` 的实际返回值比较，并另加一例用 `mkdtemp` 生成平台原生绝对根目录，使该断言在三种 OS 上都有意义。
+  - 该缺陷来自 PR #11 的 `02c9791`（`git blame` 可查），而 **PR #11 从未跑过 CI**（其 `statusCheckRollup` 为空，直接合并），因此直到本次推送才第一次暴露。这也说明发布流程的 `ci-green` 门禁是有效的：它拦住了 GitHub Release 与 npm 发布，`0.11.0` 未被发出。
+
 ### Tests
 
 - 新增 `tests/final-only.test.ts`（23 例）：8 轮 goal 续跑 → **恰好 1 条**且含第 8 轮正文；同样的 8 轮在 `silent` 下仍为 8 条（钉住这次修复的正是这个缺口）；关闭时逐条直发；只交付最后一段而不拼接；权限卡/报错不被压住；报错丢弃暂存；新人消息先交付上一件事的结论；goal 续跑**不**触发交付；硬顶在永不空闲时仍交付一次；`agent/status` 运行取消 / 空闲重新计时；`/flush` 立即交付且是 bypass 命令；跨会话 8 轮折叠为 1 条；**dispose 冲刷交付**、换绑丢弃暂存；`/final on` 写入 `config.json`、`/final off` 先交付再关闭、`/final` 显示暂存条数、`/f` 不被 `/final` 抢走；外加两条文档回归（README / CHANGELOG 必须描述真实存在的开关——这两处的上一版正好都腐烂过）。
@@ -65,6 +68,7 @@
 - 新增 `tests/host-line.test.ts`（27 例）：用真实 `semver` 在两种语义下钉住 `engines.dsh` 的准入/拒绝矩阵，断言 `peerDependencies["@deepseek-ai/dsh"]` 与 `engines.dsh` **逐字相同**、被标为 `optional`（否则安装时会把整个 harness 拖进 profile），并钉住「`<0.3.0` 会放行 `0.3.0-rc.1`、必须写 `<0.3.0-0`」这一上界细节。
 - 新增 `tests/client-panel-wiring.test.ts`（25 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起，并断言结论模式的说明里指向微信端 `/final on|off`（只在设置页读文档的用户否则永远不知道有这个开关）。
 - 新增 `tests/pr11-regressions.test.ts`（5 例）：本版三处缺陷的回归网——封顶强制发送不再自死锁（经真实入口 `deliverOutbound` 驱动 + 超时断言，覆盖原 `cold-start` 测试因直调 `parkOutbound` 而看不到的重入）、强制发送失败时队列仍受硬上限约束、机器人离线期间的完成通知不会被永久压制（两条路径各一例）。每个用例都验证过「在未修复代码上必然失败」。
+- `tests/session-log.test.ts` 增加一例平台原生绝对根目录的 `sessionLogPath` 断言（25 例），并修正原断言对 `resolveDshHome` 返回值的比较——原写法只在 Windows 成立。
 - 新增 `tests/redact.test.ts`、`tests/push-governance.test.ts`、`tests/plugin-dispose.test.ts`：脱敏规则（含误伤边界的两条显式断言）、限流与白名单、dispose 与换绑的相反语义。
 - `tests/config-store.test.ts` 增加新配置键的持久化、非法值拒绝与默认值断言；`tests/split-text.test.ts` 按新分段契约重写（含唯一允许的超长例外：最小合法形式本身就超过预算的表格/围栏）；`tests/cold-start.test.ts` 改为断言溢出时**不丢**任何一条。
 
