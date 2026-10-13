@@ -519,3 +519,66 @@ describe("inbound intercept follows the decision gate", () => {
     expect(bridge.pendingApprovals.get("u1")?.length).toBe(1);
   });
 });
+
+/**
+ * The quoted excerpt in a cross-session completion notice.
+ *
+ * Two things were wrong with a head slice: the CONCLUSION of an assistant
+ * message is at its END (the head is preamble, shown exactly when the notice
+ * matters most), and raw prose can quote a credential the model was shown.
+ */
+describe("cross-session completion preview", () => {
+  const FIRST_WORDS = "先看看这个文件的结构然后再决定怎么做";
+  const LAST_WORDS = "最终结论：缓存层已经修好了。";
+  const longText = `${FIRST_WORDS}${"中间过程".repeat(30)}${LAST_WORDS}`;
+
+  async function completionText(bridge: any, text: string): Promise<string> {
+    bridge.handleSessionEvent("sess-B", {
+      type: "assistant/message",
+      time: Date.now(),
+      data: { message: { content: [{ type: "text", text }] } },
+    });
+    bridge.handleSessionEvent("sess-B", { type: "turn/end", time: Date.now(), data: {} });
+    await flushTicks();
+    await new Promise((r) => setTimeout(r, 10));
+    const notices = sendTextMessage.mock.calls
+      .map((c: any) => c[1] as string)
+      .filter((t: string) => t.includes("任务已完成"));
+    expect(notices).toHaveLength(1);
+    return notices[0]!;
+  }
+
+  it("quotes the TAIL of the message, not the head", async () => {
+    const bridge = makeBridgeWithConfig(false, true);
+    const notice = await completionText(bridge, longText);
+    expect(notice).toContain(LAST_WORDS);
+    expect(notice).not.toContain(FIRST_WORDS);
+  });
+
+  it("measures the tail in code points, never half a surrogate pair", async () => {
+    const bridge = makeBridgeWithConfig(false, true);
+    const emoji = "👋".repeat(120);
+    const notice = await completionText(bridge, `${"x".repeat(200)}${emoji}`);
+    expect(notice).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(notice).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    // …and the truncation marker survives: it must come from the code-point
+    // walk, not from comparing code points against UTF-16 units.
+    expect(notice).toContain("…");
+  });
+
+  it("masks a credential quoted in the excerpt", async () => {
+    const bridge = makeBridgeWithConfig(false, true);
+    const notice = await completionText(
+      bridge,
+      `${"x".repeat(200)} failure was Authorization: Bearer abcDEF1234567890`,
+    );
+    expect(notice).toContain("Bearer ***");
+    expect(notice).not.toContain("abcDEF1234567890");
+  });
+
+  it("leaves a short message's own words intact (no head truncation)", async () => {
+    const bridge = makeBridgeWithConfig(false, true);
+    const notice = await completionText(bridge, "一句话结论");
+    expect(notice).toContain("> 一句话结论");
+  });
+});

@@ -390,4 +390,29 @@ describe("createUserMessage (vendored)", () => {
     expect(Object.isFrozen(message)).toBe(true);
     expect(Object.isFrozen(message.content)).toBe(true);
   });
+
+  it("structuredClones the input: the caller's objects are neither frozen nor shared", () => {
+    // Host parity. Without the clone the deep freeze reaches INTO the
+    // caller's `content` / `source`: the caller's own arrays become frozen
+    // (its next push throws in strict mode) and the published message keeps
+    // pointing at objects the caller still mutates.
+    const content = [{ type: "text" as const, text: "hello" }];
+    const source = { kind: "user" as const };
+    const input = { content, source };
+
+    const message = createUserMessage(input);
+
+    expect(Object.isFrozen(input)).toBe(false);
+    expect(Object.isFrozen(content)).toBe(false);
+    expect(Object.isFrozen(source)).toBe(false);
+    // A live reference into published "immutable" history would let a later
+    // caller mutation rewrite a message the host already persisted.
+    expect(message.content).not.toBe(content);
+    expect(message.source).not.toBe(source);
+    expect(message.content[0]).not.toBe(content[0]);
+
+    content[0]!.text = "mutated after publication";
+    expect((message.content[0] as { text: string }).text).toBe("hello");
+    expect(Object.isFrozen(message.content)).toBe(true);
+  });
 });

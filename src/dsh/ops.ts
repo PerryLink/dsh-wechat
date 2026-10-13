@@ -118,9 +118,16 @@ export interface SessionListFacts {
 
 /** Durable projection-cache snapshot used as a zero-I/O listing hint. */
 interface ProjectionCacheService {
+  /**
+   * DSH 0.1.7+ takes an optional projection-key filter as the second
+   * parameter (it is fed to `new Set(keys)`); the pre-0.1.7 signature took an
+   * `inheritedEventCount: number`. Passing `0` therefore throws
+   * `number 0 is not iterable` on every 0.2.x host, which the caller's
+   * try/catch swallowed into a silent loss of the cache hint.
+   */
   cachedSnapshot(
     header: SessionHeader,
-    inheritedEventCount: number,
+    keys?: readonly string[],
   ): { values?: Record<string, unknown> } | undefined;
 }
 
@@ -408,7 +415,7 @@ export class DshOps {
     const cache = this.get<ProjectionCacheService>("sessionProjectionCache");
     if (!cache || typeof cache.cachedSnapshot !== "function") return undefined;
     try {
-      const snap = cache.cachedSnapshot(header, 0);
+      const snap = cache.cachedSnapshot(header);
       const values = snap?.values;
       if (!values) return undefined;
       const hint: SessionListFacts = {};
@@ -758,10 +765,17 @@ export class DshOps {
   }
 
   /**
-   * Persist the same default selection the GUI edits. DSH 0.2 exposes
-   * `agent-preset-registry.selectedDefault` as a live settings field; the
-   * ordinary `default` config is only the deployment fallback. Older hosts
-   * use `agent-presets.default` instead.
+   * Persist the deployment-wide default preset — the exact selection the GUI
+   * settings page edits, so a change from WeChat shows up there and vice versa.
+   * Returns false when no settings provider is mounted or the write is refused.
+   *
+   * DSH 0.2 exposes `agent-preset-registry.selectedDefault` as a live settings
+   * field and removed `settings.get`; the ordinary `default` config is only the
+   * deployment fallback, and older hosts use `agent-presets.default` instead.
+   * The config-row id IS the settings namespace (`settings.update` resolves it
+   * against the profile's loader entries and throws `No configurable plugin
+   * entry` otherwise), so a describe-capable host must advertise the entry
+   * before we write; the legacy pair stays as the older-host path.
    */
   async saveDefaultPreset(presetId: string): Promise<boolean> {
     const settings = this.get<{
