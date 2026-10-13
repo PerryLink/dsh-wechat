@@ -130,8 +130,8 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 |---|---|
 | `/help`（`/h`、`/?`） | 帮助 |
 | `/status` | 当前状态：工作区、会话、Agent、待处理(当前)/待处理(跨会话)、当前会话 Preset、模型、上下文、权限、默认 Preset、静默、繁忙投递、跨会话决策推送、跨会话任务完成提醒；末尾追加 DSH 通过 `ctx.sessionProjections` 注册的所有会话级状态，分四段显示——`[模式]`（plan / goal / subagent / todos）、`[用量与统计]`（tokenUsage / contextPressure / contextBreakdown / sessionStats / subagentTiming）、`[会话]`（title / sessionListMetadata / permissions / imageLimits）、`[其它]`（未识别 key 自动归类）；DSH 加新 plugin 自动出现 |
-| `/workspace (ws) — list \| status \| switch <编号\|路径> \| add <路径>` | 工作区管理（list 显示各工作区会话数，不含已归档；switch/add 回复会写明恢复的会话名字和完整 id，跳过已归档；该目录无可见会话时提示发送消息将创建） |
-| `/session (s) — list [current] \| switch [current] <编号> \| new \| status` | 会话管理（list 最近 20 个，标记当前，不显示 GUI 已归档会话；`list current` 只看当前工作目录，推荐用 `switch current <编号>` 按同一列表切换；紧接着直接 `switch <编号>` 也会复用最近一次列表编号；普通无列表上下文时 `switch <编号>` 对应全量列表；switch 回复同时带会话名字和完整 id；`new` 复用当前工作区空白会话，与 GUI「新建会话」同款，无空白才新建） |
+| `/workspace (ws) — list [all\|数量] \| status \| switch <编号\|路径> \| add <路径>` | 工作区管理（list 默认显示 20 个、按添加顺序（新加的排最前），`all` 或显式数量看更多；显示各工作区会话数，不含已归档；switch/add 回复会写明恢复的会话名字和完整 id，跳过已归档；该目录无可见会话时提示发送消息将创建） |
+| `/session (s) — list [current] [all\|数量] \| switch [current] <编号> \| pin [编号] \| unpin [编号] \| new \| status` | 会话管理（list 默认显示最近 20 个，`all` 或显式数量看更多，标记当前，不显示 GUI 已归档会话；**置顶会话排在列表最前并标 `📌`**，`pin`/`unpin` 省略编号时作用于当前会话，带编号时按 `/s list` 的行号解析；`list current` 只看当前工作目录——cwd 按宿主 `fs.promises.realpath` 规则归一（尾斜杠/`..`/大小写差异都能匹配），推荐用 `switch current <编号>` 按同一列表切换；紧接着直接 `switch <编号>` 也会复用最近一次列表编号；普通无列表上下文时 `switch <编号>` 对应全量列表；switch 回复同时带会话名字和完整 id；`new` 复用当前工作区空白会话，与 GUI「新建会话」同款，无空白才新建） |
 | `/preset (p) — list \| switch <名称\|编号> \| status` | 默认 Preset（写入 DSH 设置，与 GUI 同步；`status` 看全局默认，不是当前会话；当前会话无内容时 `switch` 立即应用） |
 | `/model — list [提供商] \| switch <提供商/模型> \| status` | 模型管理（切换立即作用于当前会话 + 设为默认；当前推理等级若新模型支持则一并保留，否则清空） |
 | `/perm — status \| list \| switch <名称\|编号> \| default [名称\|编号]` | 权限管理（switch 实时切当前会话；default 写 DSH 设置，新会话生效） |
@@ -147,6 +147,9 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 
 其他 `/xxx` 命令作为文本转发给 agent；审批/提问卡双端同弹，已在其他端
 处理的卡会提示。
+
+在微信里回答卡片后会收到回执：`✅ 已允许权限卡 P{n}（工具名）。`、
+`⛔ 已拒绝权限卡 P{n}（工具名）。`、`✅ 已回复提问卡 P{n}。`——`P{n}` 就是卡片上印的编号，一次 `P1=1 P2=2` 会各回一条。回执是对你自己刚做的动作的确认，**不受** `/notify` 两个开关与静默模式影响。来自其他会话的卡片在正文里标 `❗来自其他会话`。
 
 所有命令均直接映射 DSH 原生服务（`workspaceRegistry` / `sessionQuery` /
 `agentPresets` / `agentDefaultModel` / `permissionPresets`），默认值与 GUI
@@ -222,10 +225,15 @@ npm test         # vitest（splitText/出站 Markdown 过滤/解析/帧处理/wa
 
 ## 已知边界
 
+- `/s list` 与 `/workspace list` 默认各显示 20 行，行末会提示「显示 20/N，看更多: … all（或 … <数量>）」；`all` 不设上限。会话或工作区很多时，回复会按 `textChunkLimit`（4000 字）拆成多条消息，超出微信 10 条/窗口额度的部分进入 `/next` FIFO 缓存（上限 100 条），需在微信端主动发消息或发 `/next` 继续发送。
+- `/s list` 的编号与显示窗口无关：`/s switch <编号>` 仍按**完整**列表校验，所以 `/s list` 之后 `/s switch 25` 能切到未显示的第 25 条（列表行号 1-20 与它一一对应，靠「看更多」提示按需展开）。
+- 会话置顶走宿主注册表（`workspaceRegistry.pinnedSessionIds` / `pinSession` / `unpinSession`），与 GUI 侧边栏共享同一份**持久**集合，任一端置顶或取消，另一端立即一致；`/s pin` / `/s unpin` 只写这一处，不额外落本地状态。置顶区内部仍按最近活动时间降序（对应 GUI 的「最近更新」视图——置顶时间不参与排序），所以置顶只改变分区归属，不冻结行内顺序；无置顶时行序与以前完全一致。归档与置顶互斥：已归档会话无法置顶（GUI 归档时会顺带清掉该会话的置顶），`/s list` 也不显示归档会话，因此只有「当前绑定会话」这条路径可能撞上该限制。宿主未挂载 `workspaceRegistry` 或版本早于该功能时，置顶命令提示「未提供置顶服务」并降级为无置顶显示，不会报错。
+- `list current` 的目录匹配走宿主的 canonical path 规则（`fs.promises.realpath`，与 `@deepseek-ai/dsh-workspace` 的 `realpathNormalize` 同源）：折叠尾斜杠、`.`/`..`、混合分隔符、符号链接，Windows 上也折叠大小写——与 GUI 侧边栏的工作区分组完全一致。目录已删除/无法解析时退化为 `path.resolve` 归一。`/s new` 复用空白会话、`/workspace list` 的「◀ 当前」标记、以及跨会话任务提醒的收件人解析都用同一套比较。
 - 出站文本按官方微信渠道（[Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)）的 `StreamingMarkdownFilter` 处理，而不是一律剥掉 Markdown：`**粗体**`、链接、H1–H4 标题、代码块（```）、行内代码、引用（`>`）、分隔线（`---`）与表格都原样发送；只去掉微信不渲染的部分——图片（`![alt](url)` 整段移除）、H5/H6 标题标记，以及包裹中文的单个 `*`/`_`/`***`/`___` 强调标记（内容保留）。
 - 微信「执行过程」是单条普通文本消息，没有桌面端的折叠交互。内容采用桌面端收起条目的规则：思考首行、中文工具标题与路径/描述，成功输出隐藏、失败仅一行错误、任务清单显示完成计数与变更；长分组标明省略数量，可在 DSH 查看完整记录。过程仅覆盖当前绑定会话，静默时隐藏；已推送过程与正文共享发送额度，超限走 `/next`。未推送的过程分组不跨进程重启保存。
 - 审批/提问卡挂在 Host 的 `approval/request` 与 `user-questions/request`
   waterfall 上，与 GUI 竞速；无微信 peer 时立即 `next()`，软超时只撤微信卡、不替用户决策。微信先答时会 abort 传给 GUI 的 `request.signal`（不碰 turn 的 `exec.signal`），Web composer 卡随 Gateway `cancel` 帧收起。DSH 重启后未决卡片随 turn 消失（上游已知限制）。
+- 微信回答卡片后的回执**每条占一次微信发送额度**（10 条/窗口）。一次 `P1=1 P2=2` 会发 2 条回执；额度用尽时回执与其他出站消息一样进入 `/next` FIFO 缓存，不会被丢弃。`P{n}` 是整批处理开始时快照的编号（卡片在结算时即被摘除，现算取不到编号、回执会退化成不带编号的文案）。跨会话卡的 `❗来自其他会话` 只是正文提示标记，不影响编号或回复语法。
 - `send_wechat` 工具对所有 agent 可见；任何会话的 agent 都能调用——绑定会话发送到绑定用户，未绑定会话回退到首个已知微信用户（单用户部署默认行为）。
   单用户模式下，工具推送与 assistant 回复共享唯一一份微信 10 条/窗口限流预算：超限或发送失败自动进入 `/next` FIFO 缓存队列。计数和队列持久化到 `state.json`，普通 DSH 更新或重启后继续沿用；下一条微信入站会重置窗口并自动补发。微信真实限流响应（HTTP 200 + `ret: -2` / `prepare failed`）也会被识别并缓存，不再误判成功。
 - `/preset switch` 遵循 DSH 约束：只有未产生任何内容的会话才能当场

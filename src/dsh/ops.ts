@@ -93,7 +93,45 @@ export interface WorkspaceRegistry {
    * the "hidden from lists" marker the GUI sidebar honors.
    */
   readonly archivedSessionIds: readonly string[];
+  /**
+   * Registry-global pin set (dsh-workspace): sessions surfaced ahead of every
+   * unpinned session on grouping surfaces. **Most recently pinned first** —
+   * this is the host's own array order, not a recency sort. Pinning never
+   * touches workspace accounting, and archiving a session drops its pin in
+   * the same durable write.
+   *
+   * Optional: a host older than the pin feature simply omits it, so readers
+   * must fall back to "no pinned sessions".
+   */
+  readonly pinnedSessionIds?: readonly string[];
+  /**
+   * Pin one session durably, prepending it to the pin set. Idempotent: an
+   * already pinned id resolves without writing or reordering. Rejects with
+   * `WorkspaceArchivedSessionPinError` (name-matching) for an archived
+   * session — pinning and archival are mutually exclusive — and with
+   * `WorkspaceUnknownSessionError` for a session that does not exist.
+   */
+  pinSession?(sessionId: string): Promise<void>;
+  /**
+   * Drop one session from the pin set. Idempotent and, unlike pinning, runs
+   * no session-existence check (removing an id cannot introduce an unknown
+   * one), so an entry whose session is gone still resolves.
+   */
+  unpinSession?(sessionId: string): Promise<void>;
 }
+
+/**
+ * Result of a pin/unpin attempt, mapped from the host's own outcomes so the
+ * bridge can word a precise reply without importing `@deepseek-ai/*` error
+ * classes (the host sets `err.name`, which is the stable discriminator).
+ *
+ * - `ok` — the write landed (or was already in the requested state).
+ * - `archived` — `pinSession` refused an archived session.
+ * - `unknown` — the host reported no such session.
+ * - `unavailable` — no registry, or the host version has no pin API.
+ * - `failed` — anything else (storage fault, unexpected rejection).
+ */
+export type PinOutcome = "ok" | "archived" | "unknown" | "unavailable" | "failed";
 
 export interface SessionQuery {
   listSessions(): Promise<SessionRecord[]>;
@@ -253,6 +291,74 @@ export class DshOps {
   /** Sessions hidden from every grouping surface (dsh-workspace archive set). */
   archivedSessionIds(): readonly string[] {
     return this.get<WorkspaceRegistry>("workspaceRegistry")?.archivedSessionIds ?? [];
+  }
+
+  /**
+   * Sessions pinned on every grouping surface (dsh-workspace pin set), in the
+   * host's own order — most recently pinned first. Empty when the registry is
+   * absent or the host version predates the pin feature.
+   */
+  pinnedSessionIds(): readonly string[] {
+    try {
+      return this.get<WorkspaceRegistry>("workspaceRegistry")?.pinnedSessionIds ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Whether this host exposes the durable pin API at all. Callers need it to
+   * avoid reading an *absent* pin set as "nothing is pinned" — on an older
+   * host that reading is indistinguishable from a genuinely empty set, so
+   * `/s unpin` would otherwise claim a session is not pinned instead of
+   * reporting that the service is missing.
+   */
+  supportsPin(): boolean {
+    const registry = this.get<WorkspaceRegistry>("workspaceRegistry");
+    return typeof registry?.pinSession === "function" && typeof registry?.unpinSession === "function";
+  }
+
+  /**
+   * Pin one session through the host registry, so the GUI sidebar and WeChat
+   * read one durable set. Never throws: the outcome is mapped for the caller's
+   * wording (see {@link PinOutcome}).
+   */
+  async pinSession(sessionId: string): Promise<PinOutcome> {
+    return this.writePin("pinSession", sessionId);
+  }
+
+  /**
+   * Unpin one session through the host registry. Idempotent, and the host runs
+   * no existence check here — an id that is not pinned simply resolves.
+   */
+  async unpinSession(sessionId: string): Promise<PinOutcome> {
+    return this.writePin("unpinSession", sessionId);
+  }
+
+  /**
+   * Shared body of {@link pinSession} / {@link unpinSession}: resolve the
+   * registry, refuse when this host exposes no such method, then classify the
+   * rejection by `err.name` (the host's stable discriminator, which avoids a
+   * runtime `@deepseek-ai/*` import).
+   */
+  private async writePin(
+    method: "pinSession" | "unpinSession",
+    sessionId: string,
+  ): Promise<PinOutcome> {
+    if (!sessionId) return "unknown";
+    const registry = this.get<WorkspaceRegistry>("workspaceRegistry");
+    if (!registry) return "unavailable";
+    const write = registry[method];
+    if (typeof write !== "function") return "unavailable";
+    try {
+      await write.call(registry, sessionId);
+      return "ok";
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "WorkspaceArchivedSessionPinError") return "archived";
+      if (name === "WorkspaceUnknownSessionError") return "unknown";
+      return "failed";
+    }
   }
 
   async resolveWorkspaceByPath(path: string): Promise<Workspace | undefined> {
@@ -911,16 +1017,6 @@ export class DshOps {
   async findSessionRecord(sessionId: string): Promise<SessionRecord | undefined> {
     const all = await this.listSessions();
     return all.find((r) => r.header.id === sessionId);
-  }
-
-  /**
-   * Workspace owning `sessionId`, if any. Resolved via the session's cwd and workspaceRegistry.
-   */
-  async workspaceOfSession(sessionId: string): Promise<Workspace | undefined> {
-    const record = await this.findSessionRecord(sessionId);
-    if (!record?.header.cwd) return undefined;
-    const workspaces = this.listWorkspaces();
-    return workspaces.find((w) => w.path === record.header.cwd) ?? workspaces.find((w) => w.sessionIds.includes(sessionId));
   }
 
   // ─── Context pressure (token meter) ───
