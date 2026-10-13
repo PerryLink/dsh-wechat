@@ -3,7 +3,9 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [0.10.0] - 2026-10-12
+## [Unreleased]
+
+## [0.11.0] - 2026-10-13
 
 > 本版并入上游 v0.9.7 → v0.9.11（流式帧处理、执行过程分组、官方 Markdown 语义、FIFO 发送顺序、入站重放去重、可取消长轮询、`describe()` 设置读取），在其之上加入结论模式、0.2.x 适配修复与投递可信度改进。
 
@@ -29,7 +31,7 @@
 
 ### Fixed
 
-- **`/stop` 在 DSH 0.2.x 上会让宿主抛错**：`agent.cancel("user-stop")` 传的是字符串，而 0.2.x 的 `AgentCancelCause` 是对象联合（`{kind:'user'|'parent'|'hook'|'disposed'}`），`packages/core/agent-loop/src/agent.ts` 的 `abortedCancelCause` 以 `assertNever` 收尾 ⇒ `unreachable variant: "user-stop"`，并会在下一次 `followup`/`steer` 或轮次 catch 路径上触发。现改为 `agent.cancel({ kind: "user" })`，并把 `AgentHandle.cancel` 的结构化类型收窄为真实联合。
+- **`/stop` 在 DSH 0.2.x 上会让宿主抛错，并写坏会话日志（桌面端历史永久空白）**：`agent.cancel("user-stop")` 传的是字符串，而 0.2.x 的 `AgentCancelCause` 是对象联合（`{kind:'user'|'parent'|'hook'|'disposed'}`），`packages/core/agent-loop/src/agent.ts` 的 `abortedCancelCause` 以 `assertNever` 收尾 ⇒ `unreachable variant: "user-stop"`。该异常抛在 `turn()` 的 `catch` 里、而写日志在 `finally` 里，于是 `turnEnds` 尚未赋值仍为初值 `null`，`finally` 照常把 `{"turn":N,"reason":null}` **落盘**——这是 `reason: null` 的唯一产生路径。桌面端折叠对话时间线时无保护地读 `end.data.reason.kind`，遇 `null` 抛 `TypeError`，整个历史渲染为空；而 agent 与会话状态完好，新消息仍能正常收发，因此极易误判为前端故障，且重启不自愈。现改为 `agent.cancel({ kind: "user" })`，并把 `AgentHandle.cancel` 的结构化类型收窄为真实联合（此前垫片写成 `cause: string`，正是它让这个错误通过了类型检查）。
 - **`/preset` 设置默认 Preset 自 0.1.7 起是静默空操作**：设置命名空间是按 profile 配置行 id 解析的，宿主在 0.1.7 把该行由 `agent-presets` 改名为 `agent-preset-registry`，字段由 `default` 改为 `selectedDefault`。写入旧组合会被 `settings.update` 拒绝（`No configurable plugin entry`）并被 catch 吞掉，只留一句「无法写入 DSH 设置」。现按「新组合优先、旧组合兜底」两次尝试，0.1.5 与 0.1.7+ 都能真正写入。
 - **`sessionProjectionCache.cachedSnapshot(header, 0)` 在 0.1.7+ 必抛**：第二个参数已由 `inheritedEventCount: number` 改为可选的投影键数组（直接喂 `new Set(keys)`），传 `0` 得到 `TypeError: number 0 is not iterable`，被 try/catch 吞掉后 `/s list`、`/s new` 静默失去零 I/O 列表提示、回落到读原始日志。现改为不传第二个参数，并同步修正结构化类型。
 - **`engines.dsh` 曾把整个 0.2.x 前发布线判为不兼容**：`>=0.1.5-rc.1 || >=0.1.7-0 <0.2.0` 的两个 arm 分别落在 0.1.5 与 0.1.7 元组上，按 node-semver 的前发布元组规则，**默认语义下 `0.2.0-rc.2` 是被拒绝的**（0.2.1 宿主之所以放行，只是因为它传了 `{ includePrerelease: true }`）；同时第一个 arm 无上界，反而放行 `0.3.0` 与 `1.0.0`。现改为逐元组枚举并在 0.3.0 前设精确上界：`>=0.1.5-rc.1 <0.2.0 || >=0.1.7-0 <0.2.0 || >=0.2.0-0 <0.3.0-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0`，在**默认与 includePrerelease 两种语义下**都放行 0.1.5-rc.1 → 0.2.2 且拒绝 0.3.0-rc.1 / 1.0.0。新增 `tests/host-line.test.ts` 用真实 `semver` 把这张矩阵钉死（`semver` 因此进入 devDependencies）。
@@ -41,11 +43,17 @@
   - vendored `createUserMessage` 补 `structuredClone`：此前 `deepFreeze` 会冻结并**共享**调用方的嵌套 `content`/`source`。
   - `tools.register` 与客户端 `slots.inject` 的 disposer 不再丢弃，随插件卸载释放（此前重载后工具/设置面板会残留）。
 
+- **出站队列在封顶强制发送时自死锁（致命，本版新引入）**：`parkOutbound` 只经由 `deliverOutboundLocked` 到达，而后者已持有 `serializeOutbound` 的串行槽；封顶逻辑却调用**会再次抢同一把锁**的 `flushPending`，于是该操作被排到**自己**后面，永不 resolve。后果是第 101 条入队时永久挂起，且此后**整条出站链路全部卡死**（无关的后续发送也一并 HUNG），只能重启进程。现改调锁内版本 `flushPendingLocked`。原先的 `tests/cold-start.test.ts` 直接调 `parkOutbound`、绕过了锁，因此观察不到；新增的 `tests/pr11-regressions.test.ts` 改为经由真实入口 `deliverOutbound` 驱动并加超时断言，确保这类重入不会再溜过。
+- **硬上限不再约束内存**：强制发送若**发不出去**（token 失效 / 网关拒收 / 消息窗口关闭），则没有任何条目离开队列，而 `parkOutbound` 照常追加——上限的原始目的（约束内存，连同 `state.json` 快照）被静默取消，实测 300 条入队后队列长度即为 300。现补 `MAX_OUTBOUND_QUEUE_HARD`（软上限的 4 倍）作为真正的内存边界：到达该线时**明确记录日志**并丢弃最旧一条，使「绝不静默丢弃」的承诺退化为「绝不**静默**丢弃」，而不是退化为无界进程。
+- **机器人离线期间，跨会话完成通知会被永久压制**：两处完成通知路径把 `if (!this.botReady()) continue;` 放在 `set.add(sessionId)` **之后**，于是不可达时该会话已被标记为「本回合已通知」，且**清理定时器也没挂上**；token 恢复后同一会话再结束，通知再也发不出去。现改为「立即发送路径先确认可达再占用去重位；结论模式暂存路径照常标记（其投递本就要经 `sendReply` 排队，离线暂存正是它能活下来的原因）」，并且**凡标记必挂 30 秒清理定时器**，杜绝无定时器的悬挂标记。
+- 移除只写不读的死代码 `currentGoalRound`（全仓无任何读取，投递决策实际由内联的 `source.kind` 判断完成）。
+
 ### Tests
 
 - 新增 `tests/final-only.test.ts`（16 例）：8 轮 goal 续跑 → **恰好 1 条**且含第 8 轮正文；同样的 8 轮在 `silent` 下仍为 8 条（钉住这次修复的正是这个缺口）；关闭时逐条直发；只交付最后一段而不拼接；权限卡/报错不被压住；报错丢弃暂存；新人消息先交付上一件事的结论；goal 续跑**不**触发交付；硬顶在永不空闲时仍交付一次；`agent/status` 运行取消 / 空闲重新计时；`/flush` 立即交付且是 bypass 命令；跨会话 8 轮折叠为 1 条；**dispose 冲刷交付**、换绑丢弃暂存。
 - 新增 `tests/host-line.test.ts`（20 例）：用真实 `semver` 在两种语义下钉住 `engines.dsh` 的准入/拒绝矩阵，并断言未声明 `@deepseek-ai/dsh` peer。
-- 新增 `tests/client-panel-wiring.test.ts`（22 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起。
+- 新增 `tests/client-panel-wiring.test.ts`（25 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起。
+- 新增 `tests/pr11-regressions.test.ts`（5 例）：本版三处缺陷的回归网——封顶强制发送不再自死锁（经真实入口 `deliverOutbound` 驱动 + 超时断言，覆盖原 `cold-start` 测试因直调 `parkOutbound` 而看不到的重入）、强制发送失败时队列仍受硬上限约束、机器人离线期间的完成通知不会被永久压制（两条路径各一例）。每个用例都验证过「在未修复代码上必然失败」。
 - 新增 `tests/redact.test.ts`、`tests/push-governance.test.ts`、`tests/plugin-dispose.test.ts`：脱敏规则（含误伤边界的两条显式断言）、限流与白名单、dispose 与换绑的相反语义。
 - `tests/config-store.test.ts` 增加新配置键的持久化、非法值拒绝与默认值断言；`tests/split-text.test.ts` 按新分段契约重写（含唯一允许的超长例外：最小合法形式本身就超过预算的表格/围栏）；`tests/cold-start.test.ts` 改为断言溢出时**不丢**任何一条。
 

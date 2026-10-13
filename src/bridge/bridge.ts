@@ -41,6 +41,7 @@ import type { Agent, AskUserQuestionAnswer, AskUserQuestionItem } from "../dsh/t
 import { sessionEvents } from "../dsh/types.js";
 import {
   MAX_OUTBOUND_QUEUE,
+  MAX_OUTBOUND_QUEUE_HARD,
   StateStore,
   type OutboundMessage,
   type UserState,
@@ -432,15 +433,6 @@ export class WeChatDSHBridge {
    * conclusion.
    */
   private readonly pendingFinal = new Map<string, PendingFinal>();
-  /**
-   * Session id → the `round` of the goal message currently driving the turn,
-   * as carried by `user/message` `data.source` (`{kind:'goal',round}`).
-   * Present exactly while an automatic goal continuation is driving, absent
-   * while a human message drives. Used to tell "the user asked something"
-   * apart from "the goal loop re-entered", which is the difference between
-   * "deliver the previous conclusion now" and "keep holding".
-   */
-  private readonly currentGoalRound = new Map<string, number>();
   /** One global queue and budget: dsh-wechat intentionally serves one peer. */
   private outboundCache: CachedMessage[] = [];
   private wechatMsgCount = 0;
@@ -1708,30 +1700,18 @@ export class WeChatDSHBridge {
       }
     }
 
-    // Remember whether an automatic goal continuation is driving this turn.
-    // `source.kind === "goal"` is the host's own durable attribution of a
-    // round the round-driver injected (`{kind:'goal',goalId,revision,round}`);
-    // a human prompt is `{kind:'user'}`. Subagent settlements
-    // (`subagent-settled`) and background-job wakes (`tool-jobs`) are
-    // automatic too, so they count as "not human" alongside goal rounds.
+    // The delivery decision below reads `source.kind` inline: `goal`,
+    // `subagent-settled` and `tool-jobs` are automatic (keep holding), while a
+    // human prompt is `{kind:'user'}` and must release whatever is still held —
+    // it belongs to the PREVIOUS request.
     if (event.type === "user/message") {
-      const source = (event.data as { source?: { kind?: string; round?: number } })?.source;
-      const kind = source?.kind;
-      if (kind === "goal") {
-        this.currentGoalRound.set(
-          sessionId,
-          typeof source?.round === "number" ? source.round : 0,
-        );
-      } else if (kind === "user") {
-        this.currentGoalRound.delete(sessionId);
+      const source = (event.data as { source?: { kind?: string } })?.source;
+      if (source?.kind === "user") {
         // The user is speaking again: whatever is still held belongs to the
         // PREVIOUS request, so deliver it before the new task starts holding.
         if (this.finalOnlyEnabled() && this.pendingFinal.has(sessionId)) {
           void this.flushPendingFinal(sessionId, "new-user-message");
         }
-      } else if (kind !== undefined) {
-        // subagent-settled / tool-jobs / plugin-injected: automatic.
-        this.currentGoalRound.set(sessionId, -1);
       }
     }
 
@@ -1766,21 +1746,30 @@ export class WeChatDSHBridge {
           const ctx = await this.sessionContextLabel(sessionId);
           const suffix = this.previewSuffix(sessionId);
           const body = ctx + "\n✅ 任务已完成" + suffix + "\n发送 /session switch <编号> 切换查看。";
+          const holdMode = this.finalOnlyEnabled();
+          // The immediate path must confirm reachability BEFORE claiming the
+          // dedupe slot: marking while unreachable and then bailing out would
+          // both suppress a later, deliverable completion of the same session
+          // and (as originally written) leave the mark with no cleanup timer.
+          // The hold path is exempt — a held conclusion is flushed through
+          // `sendReply`, so parking it while offline is exactly what makes it
+          // survive.
+          if (!holdMode && !this.botReady()) continue;
           const set = this.notifiedCrossSessionTurns.get(r.userId) ?? new Set<string>();
           if (set.has(sessionId)) continue;
           set.add(sessionId);
           this.notifiedCrossSessionTurns.set(r.userId, set);
+          // Arm the cleanup for every path that marks, so a mark can never
+          // outlive its 30s window without a timer to release it.
+          setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
           // 结论模式: fold this round's completion card into the task's hold
           // instead of emitting one card per auto-continued round.
-          if (this.finalOnlyEnabled()) {
+          if (holdMode) {
             this.foldFinalRound(sessionId);
             this.holdFinalNotice(r.userId, sessionId, body);
-            setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
             continue;
           }
-          if (!this.botReady()) continue;
           void this.sendReply(r.userId, body).catch(() => {});
-          setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
         }
       })();
     }
@@ -2019,7 +2008,6 @@ export class WeChatDSHBridge {
       if (entry.ceiling) clearTimeout(entry.ceiling);
     }
     this.pendingFinal.clear();
-    this.currentGoalRound.clear();
   }
 
   /**
@@ -2639,20 +2627,24 @@ export class WeChatDSHBridge {
     for (const user of recipients) {
       if (user.sessionId === sessionId) continue;
       if (!this.notifyTaskEventsEnabled()) continue;
+      const holdMode = this.finalOnlyEnabled();
+      // Same ordering rule as the bound-user path: the immediate send must
+      // confirm reachability before claiming the dedupe slot, while the hold
+      // path marks unconditionally (its delivery is deferred and parked).
+      if (!holdMode && !this.botReady()) continue;
       const set = this.notifiedCrossSessionTurns.get(user.userId) ?? new Set<string>();
       if (set.has(sessionId)) continue;
       set.add(sessionId);
       this.notifiedCrossSessionTurns.set(user.userId, set);
+      // Arm the cleanup for every path that marks.
+      setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
       // 结论模式: hold instead of one card per auto-continued round.
-      if (this.finalOnlyEnabled()) {
+      if (holdMode) {
         this.foldFinalRound(sessionId);
         this.holdFinalNotice(user.userId, sessionId, body);
-        setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
         continue;
       }
-      if (!this.botReady()) continue;
       void this.sendReply(user.userId, body).catch(() => {});
-      setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
     }
   }
 
@@ -4896,8 +4888,9 @@ export class WeChatDSHBridge {
   }
 
   /**
-   * Append to the one durable FIFO. At the hard cap the oldest item is
-   * FORCE-SENT instead of dropped.
+   * Append to the one durable FIFO. At the soft cap the oldest item is
+   * FORCE-SENT instead of dropped; at the hard ceiling it is dropped with a
+   * loud log, because that ceiling is what actually bounds memory.
    *
    * The cap exists to bound memory, but the queue's contents are exactly
    * what must not vanish: notifications, task conclusions, tool pushes. So
@@ -4905,6 +4898,12 @@ export class WeChatDSHBridge {
    * queue by being delivered. The only way it is still lost is if that send
    * itself fails, and `deliverOutboundLocked` then appends it again (there
    * is room, one slot was just freed) so nothing is destroyed silently.
+   *
+   * A force-send that keeps failing, however, frees nothing: the queue would
+   * otherwise grow for the whole outage, taking `state.json` with it. The
+   * hard ceiling is where the oldest item is sacrificed instead, so the
+   * "never silently drop" promise degrades to "never *silently* drop" rather
+   * than to an unbounded process.
    */
   private async parkOutbound(userId: string, item: CachedMessage): Promise<void> {
     // `capFlushActive` breaks the reentrancy: a failed force-send parks its
@@ -4924,10 +4923,23 @@ export class WeChatDSHBridge {
       this.capFlushes++;
       this.capFlushActive = true;
       try {
-        await this.flushPending(userId, { silent: true, force: true });
+        // MUST be the locked variant: `parkOutbound` only ever runs inside
+        // `deliverOutboundLocked`, which already holds the `serializeOutbound`
+        // slot. Calling the public `flushPending` here would queue this work
+        // behind the operation that is awaiting it — a self-deadlock that
+        // wedges the whole outbound chain (every later send, unrelated ones
+        // included, never settles).
+        await this.flushPendingLocked(userId, { silent: true, force: true });
       } finally {
         this.capFlushActive = false;
       }
+    }
+    // Hard ceiling: the force-send above could not free a slot (the outage is
+    // still in effect), so drop the oldest — explicitly, not silently.
+    while (this.outboundCache.length >= MAX_OUTBOUND_QUEUE_HARD) {
+      const evicted = this.outboundCache.shift();
+      if (evicted === undefined) break;
+      this.log(`outbound cache hard ceiling (${MAX_OUTBOUND_QUEUE_HARD}) reached; dropping oldest to bound memory: ${evicted.kind === "text" ? evicted.text.slice(0, 60) : evicted.fileName}`);
     }
     this.outboundCache.push({ ...item });
     this.persistOutboundState(userId);
