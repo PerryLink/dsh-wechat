@@ -1,8 +1,21 @@
 name: CI
 
+# Run on EVERY branch push, not only `main`.
+#
+# Why: the previous filter was `push: branches: [main]`, so pushing a feature
+# branch produced no CI run at all. A PR whose head was such a branch shipped an
+# assertion that only holds on Windows (`C:\home\.dsh` compared against a path
+# the implementation runs through `path.resolve` — on POSIX that literal is
+# relative and resolves under the cwd, so the assertion is never true). It was
+# green on the author's machine, never seen by CI, and surfaced only on the next
+# push to main — where the `ci-green` gate in release.yml then blocked the
+# release. Running CI on every branch means a PR branch is validated before the
+# PR is opened, instead of after it is merged.
+#
+# This also keeps release.yml's `ci-green` job honest: it looks for a CI run on
+# the tagged SHA, which now always exists.
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
