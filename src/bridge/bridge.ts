@@ -36,11 +36,12 @@ import { formatQuestionForWeChat, parseQuestionReply, buildAnswer } from "../ada
 import { formatApprovalCard, parseApprovalReply } from "../adapter/approval-format.js";
 import { AgentStore, type BridgeContext } from "../dsh/sessions.js";
 import { DshOps } from "../dsh/ops.js";
-import type { ModelSelection } from "../dsh/ops.js";
+import type { ModelSelection, PinOutcome, SessionRecord } from "../dsh/ops.js";
 import type { Agent, AskUserQuestionAnswer, AskUserQuestionItem } from "../dsh/types.js";
 import { sessionEvents } from "../dsh/types.js";
 import {
   MAX_OUTBOUND_QUEUE,
+  MAX_OUTBOUND_QUEUE_HARD,
   StateStore,
   type OutboundMessage,
   type UserState,
@@ -58,6 +59,7 @@ import {
   parseHistoryCommand,
   renderProjectionSection,
   parseEnterCommand,
+  parseFinalCommand,
   parseModelCommand,
   splitProviderModelTarget,
   parseNextCommand,
@@ -77,8 +79,10 @@ import {
   parseStopCommand,
   parseWorkspaceCommand,
   HISTORY_MAX,
+  LIST_DEFAULT,
   LOCAL_COMMAND_NAMES,
   type EnterCommand,
+  type FinalCommand,
   type HistoryCommand,
   type ModelCommand,
   type NotifyCommand,
@@ -431,15 +435,6 @@ export class WeChatDSHBridge {
    * conclusion.
    */
   private readonly pendingFinal = new Map<string, PendingFinal>();
-  /**
-   * Session id → the `round` of the goal message currently driving the turn,
-   * as carried by `user/message` `data.source` (`{kind:'goal',round}`).
-   * Present exactly while an automatic goal continuation is driving, absent
-   * while a human message drives. Used to tell "the user asked something"
-   * apart from "the goal loop re-entered", which is the difference between
-   * "deliver the previous conclusion now" and "keep holding".
-   */
-  private readonly currentGoalRound = new Map<string, number>();
   /** One global queue and budget: dsh-wechat intentionally serves one peer. */
   private outboundCache: CachedMessage[] = [];
   private wechatMsgCount = 0;
@@ -1479,6 +1474,12 @@ export class WeChatDSHBridge {
         return;
       }
 
+      const finalCmd = parseFinalCommand(text);
+      if (finalCmd) {
+        await this.handleFinalCommand(userId, finalCmd);
+        return;
+      }
+
       if (parseFlushCommand(text)) {
         const flushed = await this.flushAllPendingFinal("command");
         await this.sendReply(
@@ -1707,30 +1708,18 @@ export class WeChatDSHBridge {
       }
     }
 
-    // Remember whether an automatic goal continuation is driving this turn.
-    // `source.kind === "goal"` is the host's own durable attribution of a
-    // round the round-driver injected (`{kind:'goal',goalId,revision,round}`);
-    // a human prompt is `{kind:'user'}`. Subagent settlements
-    // (`subagent-settled`) and background-job wakes (`tool-jobs`) are
-    // automatic too, so they count as "not human" alongside goal rounds.
+    // The delivery decision below reads `source.kind` inline: `goal`,
+    // `subagent-settled` and `tool-jobs` are automatic (keep holding), while a
+    // human prompt is `{kind:'user'}` and must release whatever is still held —
+    // it belongs to the PREVIOUS request.
     if (event.type === "user/message") {
-      const source = (event.data as { source?: { kind?: string; round?: number } })?.source;
-      const kind = source?.kind;
-      if (kind === "goal") {
-        this.currentGoalRound.set(
-          sessionId,
-          typeof source?.round === "number" ? source.round : 0,
-        );
-      } else if (kind === "user") {
-        this.currentGoalRound.delete(sessionId);
+      const source = (event.data as { source?: { kind?: string } })?.source;
+      if (source?.kind === "user") {
         // The user is speaking again: whatever is still held belongs to the
         // PREVIOUS request, so deliver it before the new task starts holding.
         if (this.finalOnlyEnabled() && this.pendingFinal.has(sessionId)) {
           void this.flushPendingFinal(sessionId, "new-user-message");
         }
-      } else if (kind !== undefined) {
-        // subagent-settled / tool-jobs / plugin-injected: automatic.
-        this.currentGoalRound.set(sessionId, -1);
       }
     }
 
@@ -1765,21 +1754,30 @@ export class WeChatDSHBridge {
           const ctx = await this.sessionContextLabel(sessionId);
           const suffix = this.previewSuffix(sessionId);
           const body = ctx + "\n✅ 任务已完成" + suffix + "\n发送 /session switch <编号> 切换查看。";
+          const holdMode = this.finalOnlyEnabled();
+          // The immediate path must confirm reachability BEFORE claiming the
+          // dedupe slot: marking while unreachable and then bailing out would
+          // both suppress a later, deliverable completion of the same session
+          // and (as originally written) leave the mark with no cleanup timer.
+          // The hold path is exempt — a held conclusion is flushed through
+          // `sendReply`, so parking it while offline is exactly what makes it
+          // survive.
+          if (!holdMode && !this.botReady()) continue;
           const set = this.notifiedCrossSessionTurns.get(r.userId) ?? new Set<string>();
           if (set.has(sessionId)) continue;
           set.add(sessionId);
           this.notifiedCrossSessionTurns.set(r.userId, set);
+          // Arm the cleanup for every path that marks, so a mark can never
+          // outlive its 30s window without a timer to release it.
+          setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
           // 结论模式: fold this round's completion card into the task's hold
           // instead of emitting one card per auto-continued round.
-          if (this.finalOnlyEnabled()) {
+          if (holdMode) {
             this.foldFinalRound(sessionId);
             this.holdFinalNotice(r.userId, sessionId, body);
-            setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
             continue;
           }
-          if (!this.botReady()) continue;
           void this.sendReply(r.userId, body).catch(() => {});
-          setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
         }
       })();
     }
@@ -2018,7 +2016,6 @@ export class WeChatDSHBridge {
       if (entry.ceiling) clearTimeout(entry.ceiling);
     }
     this.pendingFinal.clear();
-    this.currentGoalRound.clear();
   }
 
   /**
@@ -2550,7 +2547,7 @@ export class WeChatDSHBridge {
     const currentId = this.state.getUser(userId)?.sessionId;
     const note = currentId && card.sessionId === currentId
       ? ""
-      : `\n\n（来自其他会话 — 回复 P${index}=1 允许 / P${index}=2 拒绝；P${index}=/rq 关闭此卡。直接打字会发给当前会话。）`;
+      : `\n\n（❗来自其他会话 — 回复 P${index}=1 允许 / P${index}=2 拒绝；P${index}=/rq 关闭此卡。直接打字会发给当前会话。）`;
     await this.sendReply(userId, `${context}\n${formatApprovalCard(card, index, total)}${note}`);
   }
 
@@ -2570,7 +2567,7 @@ export class WeChatDSHBridge {
     const header = total > 1 ? `❓ 提问卡 ${index}/${total}` : "❓ 提问";
     const currentId = this.state.getUser(userId)?.sessionId;
     const foreign = currentId && card.sessionId !== currentId
-      ? `\n\n（来自其他会话 — 回复 P${index}=… 指定本卡，例如 P${index}=1；P${index}=/rq 关闭此卡。直接打字会发给当前会话。）`
+      ? `\n\n（❗来自其他会话 — 回复 P${index}=… 指定本卡，例如 P${index}=1；P${index}=/rq 关闭此卡。直接打字会发给当前会话。）`
       : "";
     const tip = !foreign && total > 1
       ? `\n\n此卡编号 P${index}：回复 P${index}=… 指定本卡；P${index}=/rq 关闭此卡。`
@@ -2599,10 +2596,23 @@ export class WeChatDSHBridge {
     if (recipients.length > 0) return recipients;
     if (record.header.cwd) {
       const workspaces = this.ops.listWorkspaces();
-      const owningWs = workspaces.find((w) => w.path === record.header.cwd) ?? workspaces.find((w) => w.sessionIds.includes(sessionId));
+      const users = this.state.all();
+      // Canonical compare (host rule): the session's recorded cwd and each
+      // user's cwd may spell the same directory differently, and the
+      // workspace roster is the authority the host itself uses.
+      const resolved = await this.canonicalizePaths([
+        record.header.cwd,
+        ...workspaces.map((w) => w.path),
+        ...users.map((u) => u.cwd),
+      ]);
+      const sessionCwd = resolved.get(record.header.cwd);
+      const owningWs =
+        workspaces.find((w) => resolved.get(w.path) === sessionCwd)
+        ?? workspaces.find((w) => w.sessionIds.includes(sessionId));
       if (owningWs) {
-        for (const user of this.state.all()) {
-          if (!seen.has(user.userId) && user.cwd === owningWs.path) {
+        const wsCwd = resolved.get(owningWs.path);
+        for (const user of users) {
+          if (!seen.has(user.userId) && resolved.get(user.cwd) === wsCwd) {
             recipients.push(user);
             seen.add(user.userId);
           }
@@ -2625,20 +2635,24 @@ export class WeChatDSHBridge {
     for (const user of recipients) {
       if (user.sessionId === sessionId) continue;
       if (!this.notifyTaskEventsEnabled()) continue;
+      const holdMode = this.finalOnlyEnabled();
+      // Same ordering rule as the bound-user path: the immediate send must
+      // confirm reachability before claiming the dedupe slot, while the hold
+      // path marks unconditionally (its delivery is deferred and parked).
+      if (!holdMode && !this.botReady()) continue;
       const set = this.notifiedCrossSessionTurns.get(user.userId) ?? new Set<string>();
       if (set.has(sessionId)) continue;
       set.add(sessionId);
       this.notifiedCrossSessionTurns.set(user.userId, set);
+      // Arm the cleanup for every path that marks.
+      setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
       // 结论模式: hold instead of one card per auto-continued round.
-      if (this.finalOnlyEnabled()) {
+      if (holdMode) {
         this.foldFinalRound(sessionId);
         this.holdFinalNotice(user.userId, sessionId, body);
-        setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
         continue;
       }
-      if (!this.botReady()) continue;
       void this.sendReply(user.userId, body).catch(() => {});
-      setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
     }
   }
 
@@ -2773,6 +2787,26 @@ export class WeChatDSHBridge {
     return { index: idx >= 0 ? idx + 1 : all.length, total: all.length };
   }
 
+  /**
+   * Snapshot `rpcId → P{n}` for every answerable card, taken ONCE at the
+   * start of an inbound reply.
+   *
+   * A receipt must name the number the card was PRINTED with, and `P{n}` is
+   * a live position in the pending tables: settling a card removes it from
+   * those tables before the receipt is composed (measured — a lookup taken
+   * after the removal returns nothing, not a shifted number). Resolving
+   * against a map frozen before the batch therefore both preserves the
+   * printed number and keeps `P1=1 P2=2` from degrading to a numberless
+   * receipt.
+   */
+  private cardIndices(userId: string): Map<string, number> {
+    const map = new Map<string, number>();
+    for (const [i, entry] of this.answerableCards(userId).entries()) {
+      map.set(entry.card.rpcId, i + 1);
+    }
+    return map;
+  }
+
   // ─── Approval replies ───
 
   /** Background task completion/error notice gate (decision cards only follow `crossSessionNotify`). */
@@ -2811,6 +2845,10 @@ export class WeChatDSHBridge {
       await this.sendReply(userId, "✅ 当前没有待处理卡片。");
       return;
     }
+    // Receipts must name the number the user typed. The card is removed from
+    // the live tables as soon as it is settled, so the batch resolves against
+    // this snapshot instead of a post-removal lookup.
+    const indices = new Map(all.map((entry, i) => [entry.card.rpcId, i + 1]));
     for (const part of parts) {
       if (part.index < 1 || part.index > all.length) {
         await this.sendReply(userId, `⚠️ 卡片编号超出范围（1-${all.length}）。`);
@@ -2823,10 +2861,10 @@ export class WeChatDSHBridge {
         continue;
       }
       if (target.kind === "question") {
-        await this.answerOneQuestion(userId, target.card, part.rest);
+        await this.answerOneQuestion(userId, target.card, part.rest, indices);
       } else {
         const { decisions, warnings } = parseApprovalReply(part.rest, [target.card]);
-        await this.applyApprovalDecisions(userId, [target.card], decisions, warnings);
+        await this.applyApprovalDecisions(userId, [target.card], decisions, warnings, indices);
       }
     }
   }
@@ -2836,6 +2874,11 @@ export class WeChatDSHBridge {
     if (list.length === 0) {
       return;
     }
+    // Frozen before any card is settled. `removeApprovalCard` /
+    // `removeQuestionCard` delete from the live tables *before* the receipt
+    // is composed, so a lookup taken afterwards yields no number at all —
+    // this snapshot is what makes the receipt name the printed card.
+    const indices = this.cardIndices(userId);
 
     const pn = parsePnCardReply(text);
     if (pn) {
@@ -2851,12 +2894,12 @@ export class WeChatDSHBridge {
         return;
       }
       const { decisions, warnings } = parseApprovalReply(text, local);
-      await this.applyApprovalDecisions(userId, local, decisions, warnings);
+      await this.applyApprovalDecisions(userId, local, decisions, warnings, indices);
       return;
     }
 
     const { decisions, warnings } = parseApprovalReply(text, list);
-    await this.applyApprovalDecisions(userId, list, decisions, warnings);
+    await this.applyApprovalDecisions(userId, list, decisions, warnings, indices);
   }
 
   private async applyApprovalDecisions(
@@ -2864,6 +2907,7 @@ export class WeChatDSHBridge {
     list: PendingApproval[],
     decisions: Array<{ rpcId: string; reply: "once" | "reject" }>,
     warnings: string[],
+    indices: ReadonlyMap<string, number>,
   ): Promise<void> {
     const snapshot = [...list];
     for (const decision of decisions) {
@@ -2874,7 +2918,19 @@ export class WeChatDSHBridge {
       const receipt = await this.respondApproval(entry, outcome);
       if (!receipt.accepted) {
         void this.sendReply(userId, `ℹ️ 该权限请求已在其他端处理（${receipt.reason ?? "not-pending"}）。`).catch(() => {});
+        continue;
       }
+      // The WeChat reply is what settled this card, so the user gets a
+      // direct receipt. Deliberately NOT gated by crossSessionNotify /
+      // notifyTaskEvents / silent: those gate *unsolicited* cross-session
+      // notices, while this confirms an action the user just took — same
+      // class as the existing `/rq` receipt.
+      const pn = indices.get(entry.rpcId);
+      const label = decision.reply === "once" ? "✅ 已允许" : "⛔ 已拒绝";
+      void this.sendReply(
+        userId,
+        pn === undefined ? `${label}（${entry.toolName}）。` : `${label}权限卡 P${pn}（${entry.toolName}）。`,
+      ).catch(() => {});
     }
     for (const warning of warnings) {
       void this.sendReply(userId, `⚠️ ${warning}`).catch(() => {});
@@ -2929,6 +2985,10 @@ export class WeChatDSHBridge {
     if (list.length === 0) {
       return;
     }
+    // Same frozen numbering as the approval path — the card leaves the live
+    // tables before the receipt is composed, so the number must come from
+    // the snapshot taken above.
+    const indices = this.cardIndices(userId);
 
     const pn = parsePnCardReply(text);
     let entry: PendingQuestion;
@@ -2955,10 +3015,15 @@ export class WeChatDSHBridge {
       answerText = text;
     }
 
-    await this.answerOneQuestion(userId, entry, answerText);
+    await this.answerOneQuestion(userId, entry, answerText, indices);
   }
 
-  private async answerOneQuestion(userId: string, entry: PendingQuestion, answerText: string): Promise<void> {
+  private async answerOneQuestion(
+    userId: string,
+    entry: PendingQuestion,
+    answerText: string,
+    indices: ReadonlyMap<string, number>,
+  ): Promise<void> {
     const parsed = parseQuestionReply(answerText, entry.items);
     this.removeQuestionCard(userId, entry.rpcId);
     for (const warning of parsed.warnings) {
@@ -2967,7 +3032,13 @@ export class WeChatDSHBridge {
     const receipt = await this.respondQuestion(entry, buildAnswer(parsed, entry.items));
     if (!receipt.accepted) {
       void this.sendReply(userId, `ℹ️ 该提问已在其他端回答（${receipt.reason ?? "not-pending"}）。`).catch(() => {});
+      return;
     }
+    // Direct receipt for the user's own answer — see the note in
+    // `applyApprovalDecisions`: this confirms a just-taken action, so it is
+    // not gated by the cross-session / silent switches.
+    const pn = indices.get(entry.rpcId);
+    void this.sendReply(userId, pn === undefined ? "✅ 已回复提问卡。" : `✅ 已回复提问卡 P${pn}。`).catch(() => {});
   }
 
   private async respondQuestion(
@@ -3177,6 +3248,49 @@ export class WeChatDSHBridge {
     return this.config.silent === true;
   }
 
+  // ─── 结论模式 / final-only (/final) ───
+
+  /**
+   * `/final` — view or switch 结论模式. Mirrors `/silent`: the value is
+   * persisted to `config.json` (so a re-scan keeps it) and the settings
+   * page shows the same switch.
+   *
+   * Turning the mode OFF flushes whatever is held. A hold is a conclusion
+   * the agent has already produced — the user just asked us to stop
+   * holding things back, so handing it over now is the only reading that
+   * does not silently destroy output. (Dispose does the same; only
+   * logout / re-bind discard.)
+   */
+  private async handleFinalCommand(userId: string, cmd: FinalCommand): Promise<void> {
+    if (cmd.mode === "on") {
+      this.persistEditable({ finalOnly: true });
+      await this.sendReply(
+        userId,
+        "📌 结论模式已开启：跨轮次的中间过程不再推送，整条任务停下后只发一条最终结论。\n"
+        + "权限卡、提问卡、报错仍会立即推送；想看当前进度随时发 /flush。",
+      );
+      return;
+    }
+    if (cmd.mode === "off") {
+      this.persistEditable({ finalOnly: false });
+      const flushed = await this.flushAllPendingFinal("command-off");
+      await this.sendReply(
+        userId,
+        flushed > 0
+          ? `📤 结论模式已关闭；已取回 ${flushed} 条暂存的最终结论。之后每轮正常推送。`
+          : "📤 结论模式已关闭：之后每轮正常推送。",
+      );
+      return;
+    }
+    const held = this.pendingFinal.size;
+    await this.sendReply(
+      userId,
+      `结论模式: ${this.finalOnlyEnabled() ? "on" : "off"}`
+      + (this.finalOnlyEnabled() && held > 0 ? `（暂存 ${held} 条，发 /flush 立即取回）` : "")
+      + "\n切换: /final on|off（设置页「结论模式」同步，写入 config.json 后重新扫码仍保留）",
+    );
+  }
+
   // ─── Busy-Enter delivery behavior (/enter) ───
 
   /**
@@ -3231,13 +3345,28 @@ export class WeChatDSHBridge {
           return;
         }
         const archived = new Set(this.ops.archivedSessionIds());
-        const lines = ["📂 工作区列表（按最近使用排序）"];
-        workspaces.forEach((ws, i) => {
-          const current = user.cwd === ws.path ? " ◀ 当前" : "";
+        const shown = cmd.all ? workspaces : workspaces.slice(0, cmd.limit ?? LIST_DEFAULT);
+        // The "current" marker compares canonical paths (same canon the host
+        // uses for workspace membership) so a cwd spelled with a trailing
+        // separator or a `.` segment still matches its workspace.
+        const userCwd = await canonicalPath(user.cwd);
+        const canonicalWsPaths = new Map<string, string>();
+        const lines = [`📂 工作区列表（按添加顺序，共 ${workspaces.length} 个）`];
+        for (let i = 0; i < shown.length; i++) {
+          const ws = shown[i]!;
+          let wsPath = canonicalWsPaths.get(ws.path);
+          if (wsPath === undefined) {
+            wsPath = await canonicalPath(ws.path);
+            canonicalWsPaths.set(ws.path, wsPath);
+          }
+          const current = wsPath === userCwd ? " ◀ 当前" : "";
           const visibleCount = ws.sessionIds.filter((id) => !archived.has(id)).length;
           lines.push(`${i + 1}. ${ws.title} — ${ws.path}（${visibleCount} 会话）${current}`);
-        });
+        }
         lines.push("", "切换: /workspace switch <编号|路径>");
+        if (shown.length < workspaces.length) {
+          lines.push(`显示 ${shown.length}/${workspaces.length}，看更多: /workspace list all（或 /workspace list <数量>）`);
+        }
         await this.sendReply(userId, lines.join("\n"));
         return;
       }
@@ -3332,11 +3461,18 @@ export class WeChatDSHBridge {
    * Resolve the same recency-ordered session set for both `/s list` and
    * `/s switch`. `scope` is explicit on the command so `list current` cannot
    * accidentally be paired with the unfiltered switch list.
+   *
+   * Pinned sessions come first, then everything else. Each group keeps the
+   * recency order, so the pin set is a *partition* marker only — the host's
+   * own "most recently pinned first" array order deliberately does not drive
+   * the row order, matching the GUI's 「最近更新」 view where the pin time does
+   * not affect the sort. This keeps `/s list` numbers stable for unpinned
+   * users (no pins = byte-identical order to before).
    */
   private async listRecentSessions(user: UserState, scope?: "current") {
     const sessions = await this.ops.listSessions();
     const scoped = scope === "current"
-      ? sessions.filter((record) => record.header.cwd === user.cwd)
+      ? await this.filterByCurrentCwd(sessions, user.cwd)
       : sessions;
 
     // Cold-start recency: avoid inspecting every complete session log. Live
@@ -3349,7 +3485,59 @@ export class WeChatDSHBridge {
       }),
     );
 
-    return [...scoped].sort((a, b) => this.sessionActivityTime(b) - this.sessionActivityTime(a));
+    const pinned = new Set(this.ops.pinnedSessionIds());
+    return [...scoped].sort((a, b) => {
+      const byPin = Number(pinned.has(b.header.id)) - Number(pinned.has(a.header.id));
+      if (byPin !== 0) return byPin;
+      return this.sessionActivityTime(b) - this.sessionActivityTime(a);
+    });
+  }
+
+  /**
+   * Resolve every distinct path through {@link canonicalPath} once.
+   *
+   * Callers that compare several directories at the same time (a workspace
+   * roster against a session cwd against each user's cwd) share one Map
+   * instead of re-resolving the same spelling per comparison.
+   */
+  private async canonicalizePaths(paths: Iterable<string>): Promise<Map<string, string>> {
+    const resolved = new Map<string, string>();
+    for (const p of paths) {
+      if (resolved.has(p)) continue;
+      resolved.set(p, await canonicalPath(p));
+    }
+    return resolved;
+  }
+
+  /**
+   * Sessions whose recorded cwd is the user's current directory, compared
+   * through the host's canonical-path rule (see {@link canonicalPath}).
+   *
+   * A plain `header.cwd === user.cwd` string compare misses the same
+   * directory spelled with a trailing separator, a `.` segment, or a
+   * different letter case — the host's `workspaceRegistry` resolves all of
+   * those to one workspace, so the WeChat side must agree with it.
+   *
+   * Sessions with no recorded cwd stay excluded, as before.
+   */
+  private async filterByCurrentCwd(
+    records: SessionRecord[],
+    userCwd: string,
+  ): Promise<SessionRecord[]> {
+    const cwds: string[] = [userCwd];
+    for (const record of records) {
+      const cwd = record.header.cwd;
+      if (typeof cwd === "string" && cwd.length > 0) cwds.push(cwd);
+    }
+    const resolved = await this.canonicalizePaths(cwds);
+    const target = resolved.get(userCwd);
+    const out: SessionRecord[] = [];
+    for (const record of records) {
+      const cwd = record.header.cwd;
+      if (typeof cwd !== "string" || cwd.length === 0) continue;
+      if (resolved.get(cwd) === target) out.push(record);
+    }
+    return out;
   }
 
   /**
@@ -3378,12 +3566,18 @@ export class WeChatDSHBridge {
         // source. `/s list current` advertises the explicit scoped switch
         // form so its row numbers cannot be interpreted against all sessions.
         const allRecent = await this.listRecentSessions(user, cmd.scope);
+        // The snapshot keeps EVERY row, not just the displayed window: a
+        // following `/s switch <n>` is validated against the full list, so
+        // `/s list` then `/s switch 25` still reaches row 25 the user asked
+        // for by number (the "看更多" hint is what surfaces those rows).
         this.lastSessionListByUser.set(user.userId, {
           scope: cmd.scope,
           cwd: user.cwd,
           sessionIds: allRecent.map((record) => record.header.id),
         });
-        const recent = allRecent.slice(0, 20);
+        const recent = cmd.all ? allRecent : allRecent.slice(0, cmd.limit ?? LIST_DEFAULT);
+        const listVerb = cmd.scope === "current" ? "/s list current" : "/s list";
+        const pinnedIds = new Set(this.ops.pinnedSessionIds());
         if (recent.length === 0) {
           await this.sendReply(
             userId,
@@ -3395,7 +3589,9 @@ export class WeChatDSHBridge {
         }
         const lines = [cmd.scope === "current"
           ? `💬 最近会话（${user.cwd}，/session switch current <编号> 切换）`
-          : "💬 最近会话（按最近活动排序，/session switch <编号> 切换）"];
+          : pinnedIds.size > 0
+            ? "💬 最近会话（📌 置顶优先，其余按最近活动排序，/session switch <编号> 切换）"
+            : "💬 最近会话（按最近活动排序，/session switch <编号> 切换）"];
         // One log fold per displayed row (title + live preset). A second
         // `/s list` is a stat: session-log.cjs caches by (path, size, mtime).
         const [facts, presets] = await Promise.all([
@@ -3406,6 +3602,7 @@ export class WeChatDSHBridge {
           const record = recent[i]!;
           const row = facts[i];
           const marker = record.header.id === user.sessionId ? " ◀ 当前" : "";
+          const pin = pinnedIds.has(record.header.id) ? "📌 " : "";
           const title = cleanSessionTitle(row?.title ?? record.header.id.slice(0, 12));
           if (row?.lastUserMessageTime !== undefined) {
             this.lastActivityBySession.set(record.header.id, row.lastUserMessageTime);
@@ -3419,9 +3616,13 @@ export class WeChatDSHBridge {
           // (entries collapse together), so every field rides the same line
           // and each entry stays identifiable by its `N.` prefix.
           lines.push(
-            `${i + 1}. ${title}${marker} — ${record.header.cwd ?? "?"} · ${when}${presetLabel ? ` · Preset:${presetLabel}` : ""}`,
+            `${i + 1}. ${pin}${title}${marker} — ${record.header.cwd ?? "?"} · ${when}${presetLabel ? ` · Preset:${presetLabel}` : ""}`,
           );
         }
+        if (recent.length < allRecent.length) {
+          lines.push(`显示 ${recent.length}/${allRecent.length}，看更多: ${listVerb} all（或 ${listVerb} <数量>）`);
+        }
+        lines.push("", "置顶/取消: /s pin <编号>、/s unpin <编号>（省略编号作用于当前会话）");
         await this.sendReply(userId, lines.join("\n"));
         return;
       }
@@ -3471,6 +3672,11 @@ export class WeChatDSHBridge {
         // Flush any pending cards for the session just switched into
         // (notified earlier, or silently when nothing was pending).
         await this.flushPendingCardsForSession(user.userId, user.sessionId);
+        return;
+      }
+      case "pin":
+      case "unpin": {
+        await this.handlePinCommand(userId, user, cmd.kind, cmd.index);
         return;
       }
       case "new": {
@@ -3529,6 +3735,126 @@ export class WeChatDSHBridge {
   }
 
   /**
+   * Handle `/s pin [编号]` and `/s unpin [编号]`.
+   *
+   * The pin set lives in the host registry (`workspaceRegistry.pinnedSessionIds`),
+   * so the GUI sidebar and WeChat read and write one durable set. Without a row
+   * number the command acts on the user's currently bound session — the common
+   * case, needing no list first. With one, the number resolves through the exact
+   * rows of the latest `/s list` (same helper `/s switch` uses), so a number the
+   * user just read always addresses the row they saw.
+   *
+   * Pre-checks keep the happy path off the host's exception channel: an
+   * already-pinned id is a no-op (the host would also no-op), and an archived
+   * session cannot be pinned at all (the host would reject). Both are reported
+   * with the state the user asked about, not as a failure.
+   */
+  private async handlePinCommand(
+    userId: string,
+    user: UserState,
+    kind: "pin" | "unpin",
+    index: number | undefined,
+  ): Promise<void> {
+    let targetId: string;
+    if (index === undefined) {
+      if (!user.sessionId) {
+        await this.sendReply(
+          userId,
+          `⚠️ 当前没有绑定会话。先发消息，或 /s list 后用 /s ${kind} <编号>。`,
+        );
+        return;
+      }
+      targetId = user.sessionId;
+    } else {
+      const recent = (await this.sessionsFromLastList(user)) ?? await this.listRecentSessions(user);
+      if (index < 1 || index > recent.length) {
+        await this.sendReply(userId, `⚠️ 编号超出范围（1-${recent.length}）。`);
+        return;
+      }
+      targetId = recent[index - 1]!.header.id;
+    }
+
+    // A host without the pin API has no meaningful pin set: reading it would
+    // look exactly like "nothing is pinned", so report the missing service up
+    // front rather than answering from an absent set.
+    if (!this.ops.supportsPin()) {
+      await this.sendReply(userId, this.pinFailureText(kind, "unavailable", targetId));
+      return;
+    }
+
+    const pinned = this.ops.pinnedSessionIds();
+    const alreadyPinned = pinned.includes(targetId);
+    if (kind === "pin" && alreadyPinned) {
+      await this.sendReply(userId, `ℹ️ 该会话已置顶: ${await this.formatSessionLabel(targetId)}`);
+      return;
+    }
+    if (kind === "unpin" && !alreadyPinned) {
+      await this.sendReply(userId, `ℹ️ 该会话未置顶: ${await this.formatSessionLabel(targetId)}`);
+      return;
+    }
+    // Archived sessions are hidden from `/s list`, so only the bound-session
+    // path can reach this. Pinning and archiving are mutually exclusive in the
+    // host; report it as the archive problem it is rather than a pin failure.
+    if (kind === "pin" && this.ops.archivedSessionIds().includes(targetId)) {
+      await this.sendReply(userId, `⚠️ 该会话已归档，无法置顶: ${targetId}`);
+      return;
+    }
+
+    const outcome = kind === "pin"
+      ? await this.ops.pinSession(targetId)
+      : await this.ops.unpinSession(targetId);
+    if (outcome !== "ok") {
+      await this.sendReply(userId, this.pinFailureText(kind, outcome, targetId));
+      return;
+    }
+
+    // The pin changed the row order, so refresh the snapshot a following
+    // `/s switch <n>` / `/s pin <n>` resolves against — the numbers must keep
+    // matching what the next `/s list` renders.
+    await this.refreshSessionListSnapshot(user);
+
+    const label = await this.formatSessionLabel(targetId);
+    await this.sendReply(
+      userId,
+      kind === "pin" ? `📌 已置顶会话 ${label}` : `✅ 已取消置顶会话 ${label}`,
+    );
+  }
+
+  /** User-facing text for a non-`ok` pin outcome. */
+  private pinFailureText(kind: "pin" | "unpin", outcome: PinOutcome, sessionId: string): string {
+    switch (outcome) {
+      case "archived":
+        return `⚠️ 该会话已归档，无法置顶: ${sessionId}`;
+      case "unknown":
+        return `⚠️ 找不到该会话（可能已删除）: ${sessionId}`;
+      case "unavailable":
+        return `⚠️ 当前 DSH 未提供会话置顶服务（workspaceRegistry 不可用），${kind === "pin" ? "置顶" : "取消置顶"}未生效。`;
+      case "failed":
+        return `⚠️ ${kind === "pin" ? "置顶" : "取消置顶"}失败，请检查 DSH 日志。`;
+      case "ok":
+        return "";
+    }
+  }
+
+  /**
+   * Re-store the full recency-ordered session list for the user after a pin
+   * change, so the numbered snapshot stays aligned with the reordered rows.
+   */
+  private async refreshSessionListSnapshot(user: UserState): Promise<void> {
+    const snapshot = this.lastSessionListByUser.get(user.userId);
+    if (!snapshot) return;
+    const scope = snapshot.scope;
+    // A scoped snapshot is only valid while the user stays in that directory.
+    if (scope === "current" && snapshot.cwd !== user.cwd) return;
+    const allRecent = await this.listRecentSessions(user, scope);
+    this.lastSessionListByUser.set(user.userId, {
+      scope,
+      cwd: user.cwd,
+      sessionIds: allRecent.map((record) => record.header.id),
+    });
+  }
+
+  /**
    * Unbind the current session and mint a fresh one via `agents.ensure`.
    * Used by `/s new` when no reusable blank exists, and when the bound
    * session's log is corrupt.
@@ -3562,10 +3888,27 @@ export class WeChatDSHBridge {
    * (the caller handles "already blank" separately).
    */
   private async findBlankSession(cwd: string, excludeId?: string): Promise<string | undefined> {
-    const sessions = (await this.ops.listSessions())
-      .filter((r) => r.header.cwd === cwd && r.header.id !== excludeId)
+    const sessions = await this.ops.listSessions();
+    const cwds: string[] = [cwd];
+    for (const r of sessions) {
+      const recorded = r.header.cwd;
+      if (typeof recorded === "string" && recorded.length > 0) cwds.push(recorded);
+    }
+    // Canonical compare, like the host: a header cwd recorded before the
+    // settings-page cwd changed spelling (trailing separator, case) is still
+    // the same directory, so its blank session must be reused rather than
+    // accumulating a new blank session per /s new.
+    const resolved = await this.canonicalizePaths(cwds);
+    const target = resolved.get(cwd);
+    const candidates = sessions
+      .filter((r) => {
+        const recorded = r.header.cwd;
+        return typeof recorded === "string" && recorded.length > 0
+          && resolved.get(recorded) === target
+          && r.header.id !== excludeId;
+      })
       .sort((a, b) => b.header.createdAt - a.header.createdAt);
-    for (const record of sessions) {
+    for (const record of candidates) {
       const activity = await this.ops.inspectSessionActivity(record.header.id, record.header.cwd, record.header);
       if (activity.ok && activity.lastUserMessageTime === undefined) return record.header.id;
     }
@@ -4596,8 +4939,9 @@ export class WeChatDSHBridge {
   }
 
   /**
-   * Append to the one durable FIFO. At the hard cap the oldest item is
-   * FORCE-SENT instead of dropped.
+   * Append to the one durable FIFO. At the soft cap the oldest item is
+   * FORCE-SENT instead of dropped; at the hard ceiling it is dropped with a
+   * loud log, because that ceiling is what actually bounds memory.
    *
    * The cap exists to bound memory, but the queue's contents are exactly
    * what must not vanish: notifications, task conclusions, tool pushes. So
@@ -4605,6 +4949,12 @@ export class WeChatDSHBridge {
    * queue by being delivered. The only way it is still lost is if that send
    * itself fails, and `deliverOutboundLocked` then appends it again (there
    * is room, one slot was just freed) so nothing is destroyed silently.
+   *
+   * A force-send that keeps failing, however, frees nothing: the queue would
+   * otherwise grow for the whole outage, taking `state.json` with it. The
+   * hard ceiling is where the oldest item is sacrificed instead, so the
+   * "never silently drop" promise degrades to "never *silently* drop" rather
+   * than to an unbounded process.
    */
   private async parkOutbound(userId: string, item: CachedMessage): Promise<void> {
     // `capFlushActive` breaks the reentrancy: a failed force-send parks its
@@ -4624,10 +4974,23 @@ export class WeChatDSHBridge {
       this.capFlushes++;
       this.capFlushActive = true;
       try {
-        await this.flushPending(userId, { silent: true, force: true });
+        // MUST be the locked variant: `parkOutbound` only ever runs inside
+        // `deliverOutboundLocked`, which already holds the `serializeOutbound`
+        // slot. Calling the public `flushPending` here would queue this work
+        // behind the operation that is awaiting it — a self-deadlock that
+        // wedges the whole outbound chain (every later send, unrelated ones
+        // included, never settles).
+        await this.flushPendingLocked(userId, { silent: true, force: true });
       } finally {
         this.capFlushActive = false;
       }
+    }
+    // Hard ceiling: the force-send above could not free a slot (the outage is
+    // still in effect), so drop the oldest — explicitly, not silently.
+    while (this.outboundCache.length >= MAX_OUTBOUND_QUEUE_HARD) {
+      const evicted = this.outboundCache.shift();
+      if (evicted === undefined) break;
+      this.log(`outbound cache hard ceiling (${MAX_OUTBOUND_QUEUE_HARD}) reached; dropping oldest to bound memory: ${evicted.kind === "text" ? evicted.text.slice(0, 60) : evicted.fileName}`);
     }
     this.outboundCache.push({ ...item });
     this.persistOutboundState(userId);
@@ -4814,6 +5177,34 @@ function cleanSessionTitle(title: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 28);
+}
+
+/**
+ * Canonicalize a directory path with the host's exact canon: the
+ * `@deepseek-ai/dsh-workspace` paths module does
+ * `import { mkdir, realpath, stat } from "node:fs/promises"` and its
+ * `realpathNormalize` is `await realpath(path)`. `fs.promises.realpath` is
+ * the native-backed flavor, so this resolves trailing separators, `.` /
+ * `..` segments, mixed `/` `\` separators, symlinks AND letter case — the
+ * same normalization that decides workspace membership and session
+ * accounting on the host side. WeChat lists therefore group identically to
+ * the GUI sidebar.
+ *
+ * Note this is deliberately NOT the callback/`realpathSync` flavor, which
+ * on Windows preserves the caller's letter case and would make
+ * `C:\Work` and `c:\work` compare as two different directories while the
+ * host treats them as one.
+ *
+ * When the path cannot be resolved (a deleted/moved directory, which a
+ * registered workspace can point at), fall back to `path.resolve`, which
+ * still folds separators and `.`/`..` without touching the filesystem.
+ */
+async function canonicalPath(p: string): Promise<string> {
+  try {
+    return await fs.promises.realpath(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 /**

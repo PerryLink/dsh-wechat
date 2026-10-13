@@ -58,6 +58,39 @@ describe("settings panel ↔ host config wiring", () => {
   it("the 结论模式 control is labelled and explained to the user", () => {
     expect(client).toContain("结论模式");
     expect(client).toContain("/flush");
+    // The panel must point at the WeChat-side switch too: a user who only
+    // reads the settings page would otherwise never learn `/final` exists.
+    expect(client).toContain("/final on|off");
+  });
+
+  // The two text/number fields have their own silent-failure modes, so they are
+  // guarded the same way the checkboxes are: a field that is missing from the
+  // form init renders empty, and one missing from the save payload sends
+  // nothing while the panel still reports success.
+  it.each(["sendWechatRateLimitPerMinute", "allowedUsers"])(
+    "%s is initialised, rendered and saved",
+    (key) => {
+      expect(client).toContain(`r.body.config?.${key}`);
+      expect(client).toContain(`value: form.${key}`);
+      expect(client).toContain(`${key}:`);
+      expect((EDITABLE_KEYS as readonly string[]).includes(key)).toBe(true);
+    },
+  );
+
+  it("accepts both the numeric limit and the allowlist through the store", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wechat-panel-"));
+    try {
+      const store = new ConfigStore(dir);
+      expect(store.update({ sendWechatRateLimitPerMinute: 5 }).sendWechatRateLimitPerMinute).toBe(5);
+      expect(store.update({ allowedUsers: ["wxid_a", "wxid_b"] }).allowedUsers).toEqual(["wxid_a", "wxid_b"]);
+      // 0 is meaningful (= unlimited), so it must NOT be rejected as falsy.
+      expect(store.update({ sendWechatRateLimitPerMinute: 0 }).sendWechatRateLimitPerMinute).toBe(0);
+      // Junk is refused rather than persisted.
+      expect(store.update({ sendWechatRateLimitPerMinute: -1 }).sendWechatRateLimitPerMinute).toBe(0);
+      expect(store.update({ allowedUsers: ["ok", 7] as never }).allowedUsers).toEqual(["wxid_a", "wxid_b"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("a plain boolean round-trips through the store the panel posts to", () => {
