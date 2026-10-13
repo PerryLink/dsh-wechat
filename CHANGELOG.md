@@ -77,6 +77,8 @@
 
 ### Added
 
+- **`scripts/ci-local.sh` + README 开发须知：Windows 上"全绿"不等于 CI 绿。** CI 是 `ubuntu-latest`，而 PR #11 里一条断言把 Windows 形状的字面量 `C:\home\.dsh` 同时当输入和期望前缀——实现会先对该根目录做 `path.resolve`，在 POSIX 上它是**相对路径**、会解析到 cwd 之下，于是 `startsWith("C:\home\.dsh/sessions")` 恒为 false：本地必绿、CI 必红（该 PR 恰好从未跑过 CI，直到下一次推送才暴露，并因此让 `ci-green` 门禁拦住了 0.11.0 的发布）。脚本在与 CI 完全一致的环境里（复制到本机临时目录后 `npm ci && tsc --noEmit && vitest run`）复现整个流程，且不会用 Linux 版 esbuild/rollup 覆盖工作副本的 `node_modules`。
+
 - **打字合并 / inbound merge window（`mergeEnabled`，⚠️ 默认开启 = 默认行为变更）** —— 此前每条微信消息都是一次独立 turn，一句话分五段发就要烧掉五轮。现在同一聊天的裸文本进入缓冲区，静默窗口（`mergeSilenceMs`，默认 3000ms）到点或条数上限（`mergeMaxMsgs`，默认 10）到达时**合并成一条 prompt** 投递。安全规则是这次实现的重点，因为它们决定了这个功能是「省轮次」还是「卡住通道」：
   - **乱序的旧消息不延长计时器**——消息自带的 `create_time_ms` 早于已缓冲的最新时间戳时只追加、不重置静默窗口，否则一条迟到重放就能把批次一直挂住；更新的消息才会顺延。
   - **条数硬上限**（默认 10）作为防御性边界，缓冲区永远不会超过它。
