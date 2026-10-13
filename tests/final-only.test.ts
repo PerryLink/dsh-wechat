@@ -15,6 +15,8 @@
  * - the hard ceiling delivers even if the session never goes quiet
  * - `agent/status` running cancels the countdown, idle arms it
  * - `/flush` delivers immediately, and is a bypass command
+ * - `/final on|off|status` (alias `/fo`) is the WeChat-side switch: it
+ *   persists, `off` delivers the hold first, and `/f` stays `/flush`
  * - approvals / questions are never held (they are answerable, not narration)
  * - an agent error drops the hold instead of following it with a stale digest
  * - stop() DELIVERS the hold (dispose is not a peer rebind); re-bind discards
@@ -38,7 +40,8 @@ vi.mock("../src/weixin/send.js", () => ({
 
 import { WeChatDSHBridge } from "../src/bridge/bridge.js";
 import { defaultConfig } from "../src/config.js";
-import { isBypassSlashCommand, parseFlushCommand } from "../src/bridge/slash.js";
+import { ConfigStore } from "../src/config-store.js";
+import { isBypassSlashCommand, parseFinalCommand, parseFlushCommand } from "../src/bridge/slash.js";
 import { MessageType } from "../src/weixin/types.js";
 
 /**
@@ -338,5 +341,157 @@ describe("结论模式: lifecycle hygiene", () => {
     expect(bridge.hasPendingFinal("sess-A")).toBe(false);
     goalRound(bridge, 1, "持有中");
     expect(bridge.hasPendingFinal("sess-A")).toBe(true);
+  });
+});
+
+/**
+ * `/final` (alias `/fo`) is the WeChat-side switch for 结论模式. Before it
+ * existed the mode was reachable ONLY from the desktop settings page or a
+ * hand-edited `config.json`, so a user driving everything from WeChat could
+ * see the mode in `/status` but never change it.
+ */
+describe("结论模式: /final command", () => {
+  /** Same harness as `makeBridge`, but wired to a real ConfigStore. */
+  function makeStoredBridge(patch: Record<string, unknown> = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-wx-finalcmd-"));
+    const store = new ConfigStore(dir);
+    const cfg = store.resolve(defaultConfig());
+    cfg.storageDir = dir;
+    cfg.finalOnly = false;
+    cfg.finalOnlyIdleMs = IDLE_MS;
+    cfg.finalOnlyCeilingMs = 60_000;
+    Object.assign(cfg, patch);
+    const ctx: any = { get: () => undefined, on: () => () => {} };
+    const bridge = new WeChatDSHBridge(ctx, cfg, undefined, store);
+    const state: any = (bridge as any).state;
+    state.ensureUser("u1", "C:\\work");
+    state.update("u1", { sessionId: "sess-A" });
+    (bridge as any).token = { baseUrl: "https://x", token: "t" };
+    live.push(bridge);
+    return { bridge: bridge as any, dir, store };
+  }
+
+  const send = (bridge: any, text: string) =>
+    bridge.handleMessage({
+      message_type: MessageType.USER,
+      from_user_id: "u1",
+      context_token: "ct",
+      item_list: [{ type: 1, text_item: { text } }],
+    } as any);
+
+  it("parses /final and /fo but leaves /f to /flush", () => {
+    expect(parseFinalCommand("/final")).toEqual({ kind: "final", mode: "status" });
+    expect(parseFinalCommand("/fo on")).toEqual({ kind: "final", mode: "on" });
+    expect(parseFinalCommand("/final off")).toEqual({ kind: "final", mode: "off" });
+    expect(parseFinalCommand("/final maybe")).toBeNull();
+    expect(parseFinalCommand("/f")).toBeNull();
+    expect(isBypassSlashCommand("/final on")).toBe(true);
+    expect(isBypassSlashCommand("/fo")).toBe(true);
+  });
+
+  it("/final on switches the mode and persists it to config.json", async () => {
+    const { bridge, dir } = makeStoredBridge();
+    expect(bridge.finalOnlyEnabled()).toBe(false);
+
+    await send(bridge, "/final on");
+    await flushTicks();
+    await sleep(10);
+
+    expect(bridge.finalOnlyEnabled()).toBe(true);
+    // Persisted, not just in-memory: a re-scan / restart must keep it.
+    expect(new ConfigStore(dir).stored().finalOnly).toBe(true);
+    expect(texts().some((t) => t.includes("结论模式已开启"))).toBe(true);
+  });
+
+  it("/final off switches back and delivers whatever was held", async () => {
+    const { bridge, dir } = makeStoredBridge({ finalOnly: true, finalOnlyIdleMs: 60_000 });
+    goalRound(bridge, 1, "关闭前暂存的结论");
+    await flushTicks();
+    // Still held: the idle window is 60s.
+    expect(texts()).toHaveLength(0);
+
+    await send(bridge, "/final off");
+    await flushTicks();
+    await sleep(10);
+
+    expect(bridge.finalOnlyEnabled()).toBe(false);
+    expect(new ConfigStore(dir).stored().finalOnly).toBe(false);
+    // The hold is output the agent already produced — turning the mode off
+    // hands it over instead of destroying it.
+    expect(texts().some((t) => t.includes("关闭前暂存的结论"))).toBe(true);
+  });
+
+  it("/final status reports the mode and the held count", async () => {
+    const { bridge } = makeStoredBridge({ finalOnlyIdleMs: 60_000 });
+    await send(bridge, "/final");
+    await flushTicks();
+    await sleep(10);
+    expect(texts().some((t) => t.includes("结论模式: off"))).toBe(true);
+
+    sendTextMessage.mockClear();
+    await send(bridge, "/final on");
+    await flushTicks();
+    await sleep(10);
+    sendTextMessage.mockClear();
+
+    goalRound(bridge, 1, "暂存中");
+    await send(bridge, "/fo");
+    await flushTicks();
+    await sleep(10);
+    const status = texts().find((t) => t.includes("结论模式: on"));
+    expect(status).toBeDefined();
+    expect(status).toContain("暂存 1 条");
+  });
+
+  it("with the mode on via /final, the 8-round flood is collapsed", async () => {
+    const { bridge } = makeStoredBridge();
+    await send(bridge, "/final on");
+    await flushTicks();
+    await sleep(10);
+    sendTextMessage.mockClear();
+
+    for (let round = 1; round <= 8; round += 1) {
+      goalRound(bridge, round, `本轮进展（第 ${round}/8 轮）：…`);
+    }
+    await flushTicks();
+    expect(texts()).toHaveLength(0);
+
+    await sleep(IDLE_MS + 60);
+    const delivered = texts();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("第 8/8 轮");
+    expect(delivered[0]).toContain("共 8 轮");
+  });
+});
+
+/**
+ * The user-facing docs must describe the switch that actually exists.
+ *
+ * README is the only place a WeChat-only user can discover `/final` before
+ * typing it, and its command table is the canonical list `/help` mirrors. A
+ * row that silently disappears (or that drifts back to advertising `/f` as
+ * the alias — the one alias this command must NOT have) is the same class of
+ * bug as a parser that no longer matches its help text.
+ */
+describe("结论模式: the docs describe /final", () => {
+  const readDoc = (name: string) =>
+    fs.readFileSync(new URL(`../${name}`, import.meta.url), "utf-8");
+
+  it("README documents the command, the alias, and the /f exclusion", () => {
+    const readme = readDoc("README.md");
+    expect(readme).toContain("/final on\\|off\\|status");
+    expect(readme).toContain("`/fo`");
+    // `/f` belongs to /flush; README must say so rather than let a reader
+    // assume the obvious abbreviation works.
+    expect(readme).toMatch(/`\/f`\s*是\s*`\/flush`\s*的别名/);
+    expect(readme).toContain("**不是** `/final` 的");
+  });
+
+  it("CHANGELOG records the command under the release that adds it", () => {
+    const changelog = readDoc("CHANGELOG.md");
+    expect(changelog).toContain("`/final on|off|status`（别名 `/fo`）");
+    // The two deliberate semantics must stay documented, not just the syntax.
+    expect(changelog).toContain("`/f` 不当别名");
+    expect(changelog).toContain("先交付再关闭");
   });
 });

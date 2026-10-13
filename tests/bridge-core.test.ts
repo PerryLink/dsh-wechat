@@ -19,6 +19,8 @@ import {
   parseRejectQuestionCommand,
   parseSessionCommand,
   parseSilentCommand,
+  parseFinalCommand,
+  parseFlushCommand,
   parseSurfaceCommand,
   parseStatusCommand,
   parseStopCommand,
@@ -50,6 +52,19 @@ describe("slash parsers", () => {
     expect(parseSilentCommand("/silent off")).toEqual({ kind: "silent", mode: "off" });
     expect(parseSilentCommand("/silent status")).toEqual({ kind: "silent", mode: "status" });
     expect(parseSilentCommand("/silent maybe")).toBeNull();
+  });
+
+  it("parseFinalCommand: bare → status, on/off/status subcommands, /f is NOT an alias", () => {
+    expect(parseFinalCommand("/final")).toEqual({ kind: "final", mode: "status" });
+    expect(parseFinalCommand("/fo on")).toEqual({ kind: "final", mode: "on" });
+    expect(parseFinalCommand("/final off")).toEqual({ kind: "final", mode: "off" });
+    expect(parseFinalCommand("/final status")).toEqual({ kind: "final", mode: "status" });
+    expect(parseFinalCommand("/final maybe")).toBeNull();
+    // `/f` belongs to /flush — "take back what is held" is the opposite of
+    // "start holding", so the two must never collide.
+    expect(parseFinalCommand("/f")).toBeNull();
+    expect(parseFinalCommand("/f on")).toBeNull();
+    expect(parseFlushCommand("/f")).toBe(true);
   });
 
   it("parseSurfaceCommand: bare → status, on/off/status subcommands", () => {
@@ -248,6 +263,8 @@ describe("slash parsers", () => {
     expect(help).toContain("/perm");
     expect(help).toContain("/reasoning");
     expect(help).toContain("/silent");
+    expect(help).toContain("/final");
+    expect(help).toContain("/flush");
     expect(help).toContain("/surface");
     expect(help).toContain("/stop");
     expect(help).toContain("/next");
@@ -272,6 +289,9 @@ describe("isBypassSlashCommand", () => {
     expect(isBypassSlashCommand("/silent on")).toBe(true);
     expect(isBypassSlashCommand("/silent")).toBe(true);
     expect(isBypassSlashCommand("/sl off")).toBe(true);
+    expect(isBypassSlashCommand("/final on")).toBe(true);
+    expect(isBypassSlashCommand("/final")).toBe(true);
+    expect(isBypassSlashCommand("/fo off")).toBe(true);
     expect(isBypassSlashCommand("/surface")).toBe(true);
     expect(isBypassSlashCommand("/surface off")).toBe(true);
     expect(isBypassSlashCommand("/wxprompt on")).toBe(true);

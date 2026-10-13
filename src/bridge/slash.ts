@@ -11,6 +11,7 @@
 export type HelpCommand = { kind: "help" };
 export type StatusCommand = { kind: "status" };
 export type SilentCommand = { kind: "silent"; mode: "on" | "off" | "status" };
+export type FinalCommand = { kind: "final"; mode: "on" | "off" | "status" };
 export type SurfaceCommand = { kind: "surface"; mode: "on" | "off" | "status" };
 export type StopCommand = { kind: "stop" };
 export type RejectQuestionCommand = { kind: "reject-question" };
@@ -26,6 +27,7 @@ export type SlashCommand =
   | HelpCommand
   | StatusCommand
   | SilentCommand
+  | FinalCommand
   | StopCommand
   | RejectQuestionCommand
   | RejectPermissionCommand;
@@ -55,6 +57,24 @@ export function parseSilentCommand(text: string): SilentCommand | null {
   const m = trimmed.match(/^\/(?:silent|sl)\s+(on|off|status)\s*$/);
   if (!m) return null;
   return { kind: "silent", mode: m[1] as "on" | "off" | "status" };
+}
+
+/**
+ * Parse `/final` (alias `/fo`) — query or toggle 结论模式 (final-only).
+ * Bare command defaults to status.
+ *
+ * `/f` is deliberately NOT an alias: it already means `/flush`, and
+ * "take back what is held" is the opposite of "start holding". `/fo`
+ * is the shortest unambiguous prefix.
+ */
+export function parseFinalCommand(text: string): FinalCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/final" || trimmed === "/fo") {
+    return { kind: "final", mode: "status" };
+  }
+  const m = trimmed.match(/^\/(?:final|fo)\s+(on|off|status)\s*$/);
+  if (!m) return null;
+  return { kind: "final", mode: m[1] as "on" | "off" | "status" };
 }
 
 /**
@@ -647,6 +667,7 @@ export function isBypassSlashCommand(text: string): boolean {
     parseNextCommand(text) ||
     parseFlushCommand(text) ||
     parseSilentCommand(text) !== null ||
+    parseFinalCommand(text) !== null ||
     parseSurfaceCommand(text) !== null ||
     parseStatusCommand(text) !== null ||
     parseWorkspaceCommand(text) !== null ||
@@ -689,6 +710,8 @@ export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "busy",
   "silent",
   "sl",
+  "final",
+  "fo",
   "surface",
   "wxprompt",
   "stop",
@@ -722,6 +745,7 @@ export function formatHelp(
     "• /reasoning — 查看/设置推理等级：/reasoning [list|default|switch <等级>]",
     "• /enter (busy) — queue|steer|status 繁忙时消息投递（排队/插话，与 DSH 设置「繁忙时 Enter 键行为」同步）",
     "• /silent on|off (sl) — 开启仅每轮最终回复；关闭显示合并的思考与工具执行过程",
+    "• /final on|off (fo) — 结论模式：跨轮次暂存，整条任务停下后只发一条最终结论（优先于 /silent）",
     "• /flush (f) — 立即取回结论模式暂存的最终结论，不必等静默期",
     "• /surface on|off|status (wxprompt) — 微信渠道提示词注入开关（默认关；正文在设置页编辑）",
     "• /notify on|off|status (watch) — 跨会话决策推送：权限/提问卡整卡（默认关闭）；/notify tasks on|off 跨会话任务完成提醒",

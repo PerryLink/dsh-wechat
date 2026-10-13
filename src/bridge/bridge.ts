@@ -59,6 +59,7 @@ import {
   parseHistoryCommand,
   renderProjectionSection,
   parseEnterCommand,
+  parseFinalCommand,
   parseModelCommand,
   splitProviderModelTarget,
   parseNextCommand,
@@ -81,6 +82,7 @@ import {
   LIST_DEFAULT,
   LOCAL_COMMAND_NAMES,
   type EnterCommand,
+  type FinalCommand,
   type HistoryCommand,
   type ModelCommand,
   type NotifyCommand,
@@ -1469,6 +1471,12 @@ export class WeChatDSHBridge {
       const silent = parseSilentCommand(text);
       if (silent) {
         await this.handleSilentCommand(userId, silent.mode);
+        return;
+      }
+
+      const finalCmd = parseFinalCommand(text);
+      if (finalCmd) {
+        await this.handleFinalCommand(userId, finalCmd);
         return;
       }
 
@@ -3238,6 +3246,49 @@ export class WeChatDSHBridge {
 
   private isSilent(): boolean {
     return this.config.silent === true;
+  }
+
+  // ─── 结论模式 / final-only (/final) ───
+
+  /**
+   * `/final` — view or switch 结论模式. Mirrors `/silent`: the value is
+   * persisted to `config.json` (so a re-scan keeps it) and the settings
+   * page shows the same switch.
+   *
+   * Turning the mode OFF flushes whatever is held. A hold is a conclusion
+   * the agent has already produced — the user just asked us to stop
+   * holding things back, so handing it over now is the only reading that
+   * does not silently destroy output. (Dispose does the same; only
+   * logout / re-bind discard.)
+   */
+  private async handleFinalCommand(userId: string, cmd: FinalCommand): Promise<void> {
+    if (cmd.mode === "on") {
+      this.persistEditable({ finalOnly: true });
+      await this.sendReply(
+        userId,
+        "📌 结论模式已开启：跨轮次的中间过程不再推送，整条任务停下后只发一条最终结论。\n"
+        + "权限卡、提问卡、报错仍会立即推送；想看当前进度随时发 /flush。",
+      );
+      return;
+    }
+    if (cmd.mode === "off") {
+      this.persistEditable({ finalOnly: false });
+      const flushed = await this.flushAllPendingFinal("command-off");
+      await this.sendReply(
+        userId,
+        flushed > 0
+          ? `📤 结论模式已关闭；已取回 ${flushed} 条暂存的最终结论。之后每轮正常推送。`
+          : "📤 结论模式已关闭：之后每轮正常推送。",
+      );
+      return;
+    }
+    const held = this.pendingFinal.size;
+    await this.sendReply(
+      userId,
+      `结论模式: ${this.finalOnlyEnabled() ? "on" : "off"}`
+      + (this.finalOnlyEnabled() && held > 0 ? `（暂存 ${held} 条，发 /flush 立即取回）` : "")
+      + "\n切换: /final on|off（设置页「结论模式」同步，写入 config.json 后重新扫码仍保留）",
+    );
   }
 
   // ─── Busy-Enter delivery behavior (/enter) ───

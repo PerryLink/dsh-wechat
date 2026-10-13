@@ -20,6 +20,7 @@
   - 覆盖两条洪水路径：绑定会话的逐轮正文（`assistant/message` / `turn/end` flush）与跨会话的 `✅ 任务已完成` 卡片。
   - 生命周期清理：登出 / 重新扫码 / `resetPeerBinding()` 换绑会**丢弃**暂存（身份变了，结论不该发给下一个绑定者）；**插件 dispose / 宿主关闭则会冲刷交付**——暂存里是 agent 已经产出的结论，对端还是同一个微信用户，丢掉就是白干。
   - 优先级：`finalOnly` 开启时压过 `silent`；枚举式开关会与 `silent` 语义重复，因此保留现有 `silent` 不动、只加一个布尔开关（向后兼容，零迁移）。
+- **`/final on|off|status`（别名 `/fo`）——结论模式终于能在微信里开关。** 此前该模式只有三个入口（设置页勾选、`~/.dsh-wechat/config.json`、插件行 `config:`），**微信端一个都没有**：`/status` 能显示「结论模式: on/off」，但没有任何命令能改它，`/final` 会被当成普通文本转发给 agent。现与 `/silent` 对齐补齐（持久化、bypass 卡片、`/help`、`LOCAL_COMMAND_NAMES` 去重）。两个刻意的语义决定：**① `/f` 不当别名**——它已经是 `/flush`，而「把暂存的取回来」和「开始暂存」正好相反，别名会制造一个静默的破坏性歧义（最短无歧义前缀是 `/fo`）；**② `/final off` 先交付再关闭**——暂存里是 agent 已经产出的结论，用户说「别憋着了」时把它丢掉就是白干（与 dispose 同款语义；只有登出/换绑才丢弃）。`status` 额外显示暂存条数。
 - `/status` 增加「结论模式」行，开启时显示当前暂存条数。
 - `/flush`（`/f`）加入帮助表与 bypass 命令表（有待处理卡时也绕过卡片直接执行，与 `/next` 同款语义）。
 - **秘密脱敏 `src/utils/redact.ts`**：JWT / `sk-`·`rk-` / `gh[pousr]_` / `xox[baprs]-` / `AKIA` / `Bearer` / 32+ hex / 40+ base64 → `***`，纯函数、幂等。接在 agent 报错（绑定与跨会话）、原生命令失败、`/history` 读取失败、权限切换失败、跨会话预览这些**错误与摘录**出口上；**绝不作用于正常回复正文**（hex/base64 规则会误伤 commit SHA）。此前 `String(error)` 原样进第三方聊天记录。
@@ -34,8 +35,17 @@
 - **`/stop` 在 DSH 0.2.x 上会让宿主抛错，并写坏会话日志（桌面端历史永久空白）**：`agent.cancel("user-stop")` 传的是字符串，而 0.2.x 的 `AgentCancelCause` 是对象联合（`{kind:'user'|'parent'|'hook'|'disposed'}`），`packages/core/agent-loop/src/agent.ts` 的 `abortedCancelCause` 以 `assertNever` 收尾 ⇒ `unreachable variant: "user-stop"`。该异常抛在 `turn()` 的 `catch` 里、而写日志在 `finally` 里，于是 `turnEnds` 尚未赋值仍为初值 `null`，`finally` 照常把 `{"turn":N,"reason":null}` **落盘**——这是 `reason: null` 的唯一产生路径。桌面端折叠对话时间线时无保护地读 `end.data.reason.kind`，遇 `null` 抛 `TypeError`，整个历史渲染为空；而 agent 与会话状态完好，新消息仍能正常收发，因此极易误判为前端故障，且重启不自愈。现改为 `agent.cancel({ kind: "user" })`，并把 `AgentHandle.cancel` 的结构化类型收窄为真实联合（此前垫片写成 `cause: string`，正是它让这个错误通过了类型检查）。
 - **`/preset` 设置默认 Preset 自 0.1.7 起是静默空操作**：设置命名空间是按 profile 配置行 id 解析的，宿主在 0.1.7 把该行由 `agent-presets` 改名为 `agent-preset-registry`，字段由 `default` 改为 `selectedDefault`。写入旧组合会被 `settings.update` 拒绝（`No configurable plugin entry`）并被 catch 吞掉，只留一句「无法写入 DSH 设置」。现按「新组合优先、旧组合兜底」两次尝试，0.1.5 与 0.1.7+ 都能真正写入。
 - **`sessionProjectionCache.cachedSnapshot(header, 0)` 在 0.1.7+ 必抛**：第二个参数已由 `inheritedEventCount: number` 改为可选的投影键数组（直接喂 `new Set(keys)`），传 `0` 得到 `TypeError: number 0 is not iterable`，被 try/catch 吞掉后 `/s list`、`/s new` 静默失去零 I/O 列表提示、回落到读原始日志。现改为不传第二个参数，并同步修正结构化类型。
-- **`engines.dsh` 曾把整个 0.2.x 前发布线判为不兼容**：`>=0.1.5-rc.1 || >=0.1.7-0 <0.2.0` 的两个 arm 分别落在 0.1.5 与 0.1.7 元组上，按 node-semver 的前发布元组规则，**默认语义下 `0.2.0-rc.2` 是被拒绝的**（0.2.1 宿主之所以放行，只是因为它传了 `{ includePrerelease: true }`）；同时第一个 arm 无上界，反而放行 `0.3.0` 与 `1.0.0`。现改为逐元组枚举并在 0.3.0 前设精确上界：`>=0.1.5-rc.1 <0.2.0 || >=0.1.7-0 <0.2.0 || >=0.2.0-0 <0.3.0-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0`，在**默认与 includePrerelease 两种语义下**都放行 0.1.5-rc.1 → 0.2.2 且拒绝 0.3.0-rc.1 / 1.0.0。新增 `tests/host-line.test.ts` 用真实 `semver` 把这张矩阵钉死（`semver` 因此进入 devDependencies）。
-- 一处 `engines.dsh` 相关的事实澄清：该字段在 0.2.x 宿主上是**声明性**的——`evaluatePluginCompatibility` 只校验 `peerDependencies`，没有任何代码读 `engines`。也就是说此前的错误范围不会在运行时拦截安装，但它是对外的**兼容性声明**（插件目录、doctor 门禁、npm 页面都读它），所以仍然必须写对。本仓继续刻意不声明 `@deepseek-ai/dsh` peer（零运行时依赖原则）；一旦声明，错误的范围会让宿主**整层跳过** `dsh-wechat` bundle（`profile.ts` 抛错 → `skippedBundles`），`tests/host-line.test.ts` 因此同时把「不得顺手加上 peer」钉住。
+- **`engines.dsh` 缺上界，把 `0.3.0` 与 `1.0.0` 判为兼容**：实际前值是 `>=0.2.0-rc.2`——下限正确，但**没有任何上界**，于是 `0.3.0`、`0.3.0-rc.1`、`1.0.0` 全部落在范围内。现收为单段 `>=0.2.0-rc.2 <0.3.0-0`，两端都精确：下界保持 v0.9.7 起的 `0.2.0-rc.2`（0.1.x 线不再声称支持），上界挡在 0.3.0 线之前。
+  - 上界必须带 `-0`：写成 `<0.3.0` 时，`0.3.0-rc.1` 在 `includePrerelease` 语义下仍被放行（已实测）。
+  - 不再使用前发布元组枚举（曾一度写成五段 arm）。**唯一**读该字段的消费者是插件市场 `dshmarket`，它固定以 `{ includePrerelease: true }` 求值，在此语义下单段 arm 已放行全部 0.2.x 前发布版；而枚举**永远补不全**——每出现一个新的 0.2.x 元组都要再加一段（旧写法就漏掉了 `0.2.3-rc.1`）。单段写法与枚举式在真实消费者下判定逐项相同，且没有维护债。
+  - 事实澄清：该字段在 0.2.x 宿主上是**声明性**的——`evaluatePluginCompatibility` 只校验 `peerDependencies`，宿主代码中**没有任何一处读 `engines`**（已核对 `app.asar`：`engines?.dsh` / `manifest.engines` 等形态命中数为 0）。此前记入本 CHANGELOG 的「前值 `>=0.1.5-rc.1 || >=0.1.7-0 <0.2.0`」**有误**：该值从未出现在本仓任何一个 `package.json` 中（已遍历全部 ref 与全部 blob 核实），真实前值是 `>=0.2.0-rc.2`，故那条基于幽灵前值的说明一并订正。
+- **新增 `@deepseek-ai/dsh` peer，让宿主真正校验宿主版本**：此前宿主版本要求仅由 `engines.dsh` 声明，而宿主不读该字段，等于**没有任何强制**。现声明 `peerDependencies["@deepseek-ai/dsh"]`，值与 `engines.dsh` **逐字相同**（`>=0.2.0-rc.2 <0.3.0-0`），宿主 `evaluatePluginCompatibility` 便会以 `{ includePrerelease: true }` 校验运行版本。
+  - **同时标 `optional`**，这不是可有可无的修饰。以 `pnpm pack` 后的 tarball 安装（最接近 registry 路径）实测，两个变量都要说清：
+    - **不加 `optional`，安装直接失败**（`exit=1`）：peer 被当成需要解析的真实依赖，`@deepseek-ai/dsh` 元包带 82 条 dependencies，会拉进 530 个包，最终撞上 `@deepseek-ai/dsh-type-meta` 的 npm **404**（该包未发布）。
+    - 即使解析成功，`optional` 也决定 profile 体积：lockfile 从 28 行膨胀到 **8199 行**（3769 处 `@deepseek-ai/dsh*`）。
+    - 加上 `peerDependenciesMeta["@deepseek-ai/dsh"].optional = true` 后 `exit=0`，lockfile 稳定在 28 行、仅 2 处提及（即声明本身）。
+    - 宿主门禁**不读** `peerDependenciesMeta`（用真实 `@deepseek-ai/dsh-app-boot@0.2.0-rc.2` 的 `evaluatePluginCompatibility` 实测：标了 optional、范围写错仍判 REJECTED），因此强制力不受影响。
+  - 风险与代价必须写明：peer 不匹配时宿主**跳过整个 `dsh-wechat` bundle**（`profile.ts` 把抛错收进 `skippedBundles`）。**不是完全无声**——`reportSkippedBundles` 每次启动会向 stderr 写一行 `dsh: skipping profile bundle "dsh-wechat": …`，但桌面端 GUI 看不到，表现就是插件消失；救回需在 profile 的 `compatibility.json` 里按 `包名@版本` → 运行时版本登记精确豁免。
 
 - **宿主契约硬化（按 `dsh-v0.2.0-rc.2` 源码逐项核对，无其余签名/形状断裂）**：
   - `session-log.cjs` 的 `encodeSegment` 改为宿主同款 `~XXXX` 转义（每个 `[A-Za-z0-9._-]` 之外的码元，`~` → `~007E`，`.`/`..` 特判）。原来的 `encodeURIComponent` 对本仓自铸的 `session-<uuid>` 恰好一致，但 id 含 `~ ! * ' ( )` 或非 ASCII 时会静默指向不存在的目录。
@@ -50,9 +60,10 @@
 
 ### Tests
 
-- 新增 `tests/final-only.test.ts`（16 例）：8 轮 goal 续跑 → **恰好 1 条**且含第 8 轮正文；同样的 8 轮在 `silent` 下仍为 8 条（钉住这次修复的正是这个缺口）；关闭时逐条直发；只交付最后一段而不拼接；权限卡/报错不被压住；报错丢弃暂存；新人消息先交付上一件事的结论；goal 续跑**不**触发交付；硬顶在永不空闲时仍交付一次；`agent/status` 运行取消 / 空闲重新计时；`/flush` 立即交付且是 bypass 命令；跨会话 8 轮折叠为 1 条；**dispose 冲刷交付**、换绑丢弃暂存。
-- 新增 `tests/host-line.test.ts`（20 例）：用真实 `semver` 在两种语义下钉住 `engines.dsh` 的准入/拒绝矩阵，并断言未声明 `@deepseek-ai/dsh` peer。
-- 新增 `tests/client-panel-wiring.test.ts`（25 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起。
+- 新增 `tests/final-only.test.ts`（23 例）：8 轮 goal 续跑 → **恰好 1 条**且含第 8 轮正文；同样的 8 轮在 `silent` 下仍为 8 条（钉住这次修复的正是这个缺口）；关闭时逐条直发；只交付最后一段而不拼接；权限卡/报错不被压住；报错丢弃暂存；新人消息先交付上一件事的结论；goal 续跑**不**触发交付；硬顶在永不空闲时仍交付一次；`agent/status` 运行取消 / 空闲重新计时；`/flush` 立即交付且是 bypass 命令；跨会话 8 轮折叠为 1 条；**dispose 冲刷交付**、换绑丢弃暂存；`/final on` 写入 `config.json`、`/final off` 先交付再关闭、`/final` 显示暂存条数、`/f` 不被 `/final` 抢走；外加两条文档回归（README / CHANGELOG 必须描述真实存在的开关——这两处的上一版正好都腐烂过）。
+- `tests/native-command.test.ts` 增加一例：即使 profile 恰好注册了同名 `final` 原生命令，`LOCAL_COMMAND_NAMES` 也必须让本地 `/final` 处理器胜出（该用例在移除这两个名字后必然失败）；`tests/bridge-core.test.ts` 补齐 `parseFinalCommand` 的解析矩阵与 `/help`、bypass 断言。
+- 新增 `tests/host-line.test.ts`（27 例）：用真实 `semver` 在两种语义下钉住 `engines.dsh` 的准入/拒绝矩阵，断言 `peerDependencies["@deepseek-ai/dsh"]` 与 `engines.dsh` **逐字相同**、被标为 `optional`（否则安装时会把整个 harness 拖进 profile），并钉住「`<0.3.0` 会放行 `0.3.0-rc.1`、必须写 `<0.3.0-0`」这一上界细节。
+- 新增 `tests/client-panel-wiring.test.ts`（25 例）：`src/client.js` 没有测试覆盖，而新增开关有三种「静默失效」写法（form 初始化、保存 payload、JSX 各缺一处都会返回 `{ok:true}` 但什么都不落盘）。该文件把设置页渲染的每个开关与 `EDITABLE_KEYS` 两侧钉在一起，并断言结论模式的说明里指向微信端 `/final on|off`（只在设置页读文档的用户否则永远不知道有这个开关）。
 - 新增 `tests/pr11-regressions.test.ts`（5 例）：本版三处缺陷的回归网——封顶强制发送不再自死锁（经真实入口 `deliverOutbound` 驱动 + 超时断言，覆盖原 `cold-start` 测试因直调 `parkOutbound` 而看不到的重入）、强制发送失败时队列仍受硬上限约束、机器人离线期间的完成通知不会被永久压制（两条路径各一例）。每个用例都验证过「在未修复代码上必然失败」。
 - 新增 `tests/redact.test.ts`、`tests/push-governance.test.ts`、`tests/plugin-dispose.test.ts`：脱敏规则（含误伤边界的两条显式断言）、限流与白名单、dispose 与换绑的相反语义。
 - `tests/config-store.test.ts` 增加新配置键的持久化、非法值拒绝与默认值断言；`tests/split-text.test.ts` 按新分段契约重写（含唯一允许的超长例外：最小合法形式本身就超过预算的表格/围栏）；`tests/cold-start.test.ts` 改为断言溢出时**不丢**任何一条。
@@ -623,3 +634,5 @@
 - 断点续传：`sync-buf` 与会话映射持久化，重启后自动恢复
 - Preset/权限/模型默认值与 GUI 设置页同源同步（DSH 设置文档）
 - 微信 10 条/轮发送限制：自动缓存 + `/next` 继续，第 8 条起提醒
+
+

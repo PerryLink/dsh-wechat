@@ -373,7 +373,7 @@ window.__ModuleLoader__.load({
 						createElement("label", { className: "wx_check" },
 							createElement("input", { type: "checkbox", checked: !!form?.finalOnly, onChange: (e) => setForm({ ...form, finalOnly: e.target.checked }) }),
 							createElement("span", null, "结论模式"),
-							createElement(HelpTip, { text: "只回最终结论：跨轮次的中间过程一律暂存，整条任务彻底停下来后只发一条最终结论（自动续跑再多轮也只发一条）。权限卡、提问卡、报错始终立即推送，不会被压住。默认静默 45 秒后交付，最长 10 分钟必发一次；想看当前进度可随时在微信发 /flush。开启后优先于「静默」。" }),
+							createElement(HelpTip, { text: "只回最终结论：跨轮次的中间过程一律暂存，整条任务彻底停下来后只发一条最终结论（自动续跑再多轮也只发一条）。权限卡、提问卡、报错始终立即推送，不会被压住。默认静默 45 秒后交付，最长 10 分钟必发一次；想看当前进度可随时在微信发 /flush。开启后优先于「静默」。微信端也可用 /final on|off 切换（与这里同一个值）。" }),
 						),
 						createElement("label", { className: "wx_check" },
 							createElement("input", { type: "checkbox", checked: !!form?.surfacePromptEnabled, onChange: (e) => setForm({ ...form, surfacePromptEnabled: e.target.checked }) }),

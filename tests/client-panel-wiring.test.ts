@@ -58,6 +58,9 @@ describe("settings panel ↔ host config wiring", () => {
   it("the 结论模式 control is labelled and explained to the user", () => {
     expect(client).toContain("结论模式");
     expect(client).toContain("/flush");
+    // The panel must point at the WeChat-side switch too: a user who only
+    // reads the settings page would otherwise never learn `/final` exists.
+    expect(client).toContain("/final on|off");
   });
 
   // The two text/number fields have their own silent-failure modes, so they are
