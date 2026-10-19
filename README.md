@@ -227,6 +227,22 @@ send_wechat
 
 *Observed from `tests/send-wechat.test.ts:92-102; src/index.ts:146-193 (tool registration); README.md:87`*
 
+#### Failure branch
+
+**Input**
+
+~~~text
+{"text":"hi"} from an unbound session with no known WeChat user
+~~~
+
+**Output**
+
+~~~text
+{"ok":false,"message":"no WeChat user has interacted yet; a WeChat message must arrive before send_wechat can be used"}
+~~~
+
+*Observed from `plugins/dsh-wechat/src/bridge/bridge.ts:5635; plugins/dsh-wechat/tests/send-wechat.test.ts:179-186`*
+
 #### Brief examples
 
 - `/session`
