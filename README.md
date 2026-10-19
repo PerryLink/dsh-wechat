@@ -12,6 +12,10 @@ DSH 设置页内扫码登录与连接配置。以静态 Cordis 插件交付，�
 
 <img src="./resources/send.jpg" alt="发送" width="32%" /> <img src="./resources/receive.jpg" alt="接收" width="32%" /> <img src="./resources/settings.png" alt="设置页" width="32%" />
 
+![Workflow diagram for dsh-wechat: install → open panel → act.](docs/assets/dsh-wechat-flow.svg)
+
+*Workflow overview: install → open panel → act. The examples below use the real command surface.*
+
 ## 安装（部署到 DSH profile）
 
 当前版本要求 **DSH `>=0.2.1-0`（且 `<0.3.0-0`）**。这条要求写了两处：`engines.dsh`（供插件市场展示，宿主不读）与 `peerDependencies["@deepseek-ai/dsh"]`（宿主**强制校验**——不匹配会跳过整个插件包）。低于 `0.2.1-0` 或高于 `0.2.x` 的 DSH 会被拒绝加载。
@@ -196,6 +200,19 @@ profile 实际注册的所有原生命令；本地命令表里已有的名字自
 
 与宿主通信走插件自己的 HTTP API（`/wechat/api/status|help|config|relogin|
 logout`），客户端零 `@deepseek-ai` 依赖。
+
+### Examples
+
+These are the plugin's real entry points; install once, then call one.
+
+#### Detailed example
+
+- `/workspace`
+
+#### Brief examples
+
+- `/session`
+- `/preset`
 
 ## 配置
 
