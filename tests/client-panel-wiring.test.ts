@@ -34,6 +34,11 @@ const RENDERED_TOGGLES = [
   "silent",
   "finalOnly",
   "surfacePromptEnabled",
+  // Hardening wave: the merge window and the two security switches.
+  "mergeEnabled",
+  "mergeSuffixTokens",
+  "allowRemotePermissionEscalation",
+  "allowAnyFilePath",
 ] as const;
 
 describe("settings panel ↔ host config wiring", () => {
@@ -63,11 +68,28 @@ describe("settings panel ↔ host config wiring", () => {
     expect(client).toContain("/final on|off");
   });
 
+  it("the 打字合并 control points at the WeChat-side switch", () => {
+    expect(client).toContain("打字合并");
+    expect(client).toContain("/merge on|off");
+    // The suffix tokens are the reason the feature is usable at all; the
+    // panel has to document them.
+    expect(client).toContain("`..`");
+    expect(client).toContain("`!!`");
+  });
+
   // The two text/number fields have their own silent-failure modes, so they are
   // guarded the same way the checkboxes are: a field that is missing from the
   // form init renders empty, and one missing from the save payload sends
   // nothing while the panel still reports success.
-  it.each(["sendWechatRateLimitPerMinute", "allowedUsers"])(
+  it.each([
+    "sendWechatRateLimitPerMinute",
+    "allowedUsers",
+    // Hardening wave: the merge parameters and the outgoing-file size cap.
+    "mergeSilenceMs",
+    "mergeMaxMsgs",
+    "mergeForcedReleaseMs",
+    "maxOutgoingFileBytes",
+  ])(
     "%s is initialised, rendered and saved",
     (key) => {
       expect(client).toContain(`r.body.config?.${key}`);
