@@ -207,7 +207,25 @@ These are the plugin's real entry points; install once, then call one.
 
 #### Detailed example
 
-- `/workspace`
+**Command**
+
+~~~sh
+send_wechat
+~~~
+
+**Input**
+
+~~~json
+{"text":"hello"}
+~~~
+
+**Output**
+
+~~~text
+{"ok":true,"message":"sent 1 message(s)"}
+~~~
+
+*Observed from `tests/send-wechat.test.ts:92-102; src/index.ts:146-193 (tool registration); README.md:87`*
 
 #### Brief examples
 
