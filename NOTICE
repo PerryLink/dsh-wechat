@@ -1,0 +1,18 @@
+dsh-wechat
+==========
+
+This repository is a fork of:
+
+  pan17/dsh-wechat
+  https://github.com/pan17/dsh-wechat
+
+The upstream project and the upstream-derived code in this repository are
+licensed under the MIT License; see LICENSE.
+
+Fork-only modifications and new files added by PerryLink are licensed under the
+Apache License, Version 2.0; see LICENSE-APACHE. They are identified by their
+presence in PerryLink-authored commits after the upstream merge.
+
+This NOTICE does not replace either license. Where the two overlap, the MIT
+license remains the license of the upstream-derived code, and the Apache-2.0
+license applies only to PerryLink's additions.

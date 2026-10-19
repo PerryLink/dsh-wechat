@@ -416,3 +416,5 @@ This project is one of the **87 actively maintained** DeepSeek Harness plugins f
 </details>
 
 </details>
+
+**Fork licensing.** This fork keeps the upstream MIT license (`LICENSE`). PerryLink-only additions are Apache-2.0 (`LICENSE-APACHE`); see `NOTICE`. The upstream PR uses the upstream MIT terms.
