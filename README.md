@@ -41,7 +41,7 @@ DSH 设置页内扫码登录与连接配置。以静态 Cordis 插件交付，�
 
 ## 安装（部署到 DSH profile）
 
-当前版本要求 **DSH `>=0.2.0-rc.2`（且 `<0.3.0-0`）**。这条要求写了两处：`engines.dsh`（供插件市场展示，宿主不读）与 `peerDependencies["@deepseek-ai/dsh"]`（宿主**强制校验**——不匹配会跳过整个插件包）。低于 `0.2.0-rc.2` 或高于 `0.2.x` 的 DSH 会被拒绝加载。
+当前版本要求 **DSH `>=0.2.1-0`（且 `<0.3.0-0`）**。这条要求写了两处：`engines.dsh`（供插件市场展示，宿主不读）与 `peerDependencies["@deepseek-ai/dsh"]`（宿主**强制校验**——不匹配会跳过整个插件包）。低于 `0.2.1-0` 或高于 `0.2.x` 的 DSH 会被拒绝加载。
 
 ### 方式一：设置页内直接安装（推荐）
 
@@ -242,7 +242,7 @@ logout`），客户端零 `@deepseek-ai` 依赖。
 ```bash
 npm install
 npm run build    # tsc → dist/
-npm test         # vitest（splitText/出站 Markdown 过滤/解析/帧处理/waterfall 竞速/状态存储/命令解析/超时恢复/状态颜色/历史截断/渠道提示词/结论模式/打字合并/脱敏/限流与白名单/权限提权闸门/send_wechat 文件边界/白名单播种/审计与文件权限/出站串行槽/有界缓存/dispose 语义/驱动宿主版本区间/DSH >=0.2.0-rc.2 适配）
+npm test         # vitest（splitText/出站 Markdown 过滤/解析/帧处理/waterfall 竞速/状态存储/命令解析/超时恢复/状态颜色/历史截断/渠道提示词/结论模式/打字合并/脱敏/限流与白名单/权限提权闸门/send_wechat 文件边界/白名单播种/审计与文件权限/出站串行槽/有界缓存/dispose 语义/驱动宿主版本区间/DSH >=0.2.1-0 适配）
 ```
 
 ⚠️ **CI 跑在 Linux（`ubuntu-latest`）上，所以 Windows 上"全绿"不等于 CI 绿。** 已经踩过一次：一条断言把 Windows 形状的字面量 `C:\home\.dsh` 同时当输入和期望前缀，而实现会先对该根目录做 `path.resolve`——在 POSIX 上那是**相对路径**，会解析到 cwd 之下，于是 `built.startsWith("C:\home\.dsh/sessions")` 恒为 false，本地 Windows 必绿、CI 必红。
@@ -255,13 +255,13 @@ bash scripts/ci-local.sh    # Linux / macOS / Windows 的 WSL 里都可用
 
 它把检出复制到本机临时目录再 `npm ci && tsc --noEmit && vitest run`（与 CI 完全一致），因此不会用 Linux 版的 esbuild/rollup 覆盖你工作副本里的 `node_modules`。
 
-当前版本针对 **DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`** 的宿主 API；仓库本身不依赖任何 `@deepseek-ai/dsh-*` 运行时包（`peerDependencies` 里的 `@deepseek-ai/dsh` 是**宿主契约声明**，不是依赖，并已标 `optional` 以免安装时把整个 harness 拖进 profile）。宿主版本要求写了两处、值完全一致：
+当前版本针对 **DeepSeek Harness `>=0.2.1-0 <0.3.0-0`** 的宿主 API；仓库本身不依赖任何 `@deepseek-ai/dsh-*` 运行时包（`peerDependencies` 里的 `@deepseek-ai/dsh` 是**宿主契约声明**，不是依赖，并已标 `optional` 以免安装时把整个 harness 拖进 profile）。宿主版本要求写了两处、值完全一致：
 
 - `engines.dsh` —— **声明性**。宿主 `evaluatePluginCompatibility` 只校验 `peerDependencies`，**没有任何代码读 `engines`**；真正读它的是插件市场 `dshmarket`（顶层 `engines.dsh` 优先于嵌套 `dsh.engines.dsh`），且固定以 `{ includePrerelease: true }` 求值。
 - `peerDependencies["@deepseek-ai/dsh"]` —— **强制**。不匹配时宿主会**跳过整个 `dsh-wechat` bundle**（`profile.ts` 抛错 → `skippedBundles`，并在每次启动时向 stderr 写一行 `skipping profile bundle`），插件在桌面端表现为消失。
   - 该 peer 必须同时标 `peerDependenciesMeta.optional`。实测（`pnpm pack` 后 tarball 安装）：不加 `optional` 会**安装失败**（`exit=1`）——peer 被当成真实依赖解析，`@deepseek-ai/dsh` 元包带 82 条 dependencies，会拉进 530 个包并撞上未发布包 `@deepseek-ai/dsh-type-meta` 的 npm 404；即使能解析，lockfile 也会从 28 行膨胀到 8199 行。加 `optional` 后 `exit=0`、lockfile 28 行。宿主门禁**不读** `peerDependenciesMeta`，所以强制力不受影响。
 
-范围只有一段 arm，因为前发布元组枚举并无必要：唯一消费者在 `includePrerelease` 语义下求值，一条 `>=0.2.0-rc.2 <0.3.0-0` 已放行全部 0.2.x 前发布版；而枚举永远补不全（每来一个新的 0.2.x 元组都得再加一条）。上界必须写成 `<0.3.0-0` 而非 `<0.3.0`——后者在 `includePrerelease` 下会放行 `0.3.0-rc.1`。`tests/host-line.test.ts` 用真实 `semver` 把这张准入/拒绝矩阵与两处声明的一致性钉死。
+范围只有一段 arm，因为前发布元组枚举并无必要：唯一消费者在 `includePrerelease` 语义下求值，一条 `>=0.2.1-0 <0.3.0-0` 已放行全部 0.2.x 前发布版；而枚举永远补不全（每来一个新的 0.2.x 元组都得再加一条）。上界必须写成 `<0.3.0-0` 而非 `<0.3.0`——后者在 `includePrerelease` 下会放行 `0.3.0-rc.1`。`tests/host-line.test.ts` 用真实 `semver` 把这张准入/拒绝矩阵与两处声明的一致性钉死。
 
 > **与生态另一种写法的对比**：`@anysearch/anysearch-dsh` 不写 `engines.dsh`，而是对**具体子包**声明 `peerDependencies`（`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-web` 等）且大多用 `"*"`，其 `docs/dsh-compatibility.md` 明确说这是「默认放行新 DSH 版本、矩阵只记录已验证版本而非安装白名单」。两者取舍不同：`"*"` 换来「新宿主版本无需改 manifest」，代价是**放弃版本防护**（`*` 连 `99.0.0` 都放行）；本仓选择精确区间，代价是 DSH 大版本升级时要主动更新声明。注意 anysearch 那套用 `"*"` 无法照搬到一个元包 peer 上——`@deepseek-ai/dsh` 是聚合包，解析它就会拉整棵依赖树。
 

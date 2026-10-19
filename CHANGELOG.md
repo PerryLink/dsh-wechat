@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.1] - 2026-10-19
+
+### Compatibility
+
+- **DSH 0.2.1-rc.2 adaptation.** The enforced host range is now `>=0.2.1-0 <0.3.0` in both `engines.dsh` and the `@deepseek-ai/dsh` peer; 0.2.1-rc.2 is explicitly in the admission matrix. The 0.2.0 line is no longer claimed. No runtime API change was required: `dsh-wechat@0.11.0` passes a real rc.2 host smoke (HTTP 200 + boot marker).
+
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
