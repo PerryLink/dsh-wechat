@@ -63,8 +63,121 @@ export interface WeChatDSHConfig {
    * historical single-peer behaviour: the first inbound user becomes the
    * bound peer. Non-empty means only those ids are processed — anyone else
    * is ignored with a log line, never answered.
+   *
+   * On upgrade the bridge SEEDS this list from the already bound peer when it
+   * is still empty (see `WeChatDSHBridge.seedAllowlistFromPeer`): before that,
+   * an install which had already been claimed by one user would hand ownership
+   * to whoever messaged first after the upgrade. A brand-new install (no bound
+   * peer yet) keeps first-contact-wins.
    */
   allowedUsers: string[];
+  /**
+   * Allow `/perm default <preset>` from WeChat to raise the GLOBAL, persistent
+   * permission default (`permission.defaultPreset`, which applies to every
+   * future session of this DSH install, WeChat-related or not).
+   *
+   * Default `false`: a chat message may only write a default that does not
+   * escalate — a preset whose resolved sandbox is `danger-full-access` or
+   * whose approval policy is `never` is refused with a pointer to the DSH
+   * settings page. Session-scoped `/perm switch` is unaffected (it is not
+   * persistent), and set this to `true` to restore the pre-guard behaviour.
+   */
+  allowRemotePermissionEscalation: boolean;
+  /**
+   * Allow `send_wechat` to read ANY absolute path on the host.
+   *
+   * Default `false`, which confines the tool to files inside the CALLING
+   * session's working directory or a registered workspace: without a bound,
+   * the tool is an arbitrary-file-read primitive for any agent (and for
+   * anything that can talk an agent into calling it). Set to `true` to
+   * restore the pre-bound behaviour.
+   */
+  allowAnyFilePath: boolean;
+  /**
+   * Hard size ceiling for a file handed to `send_wechat` (bytes). A larger
+   * file is refused before it is read or queued, so an agent cannot turn the
+   * bridge into a memory/spool amplifier. Default 20 MiB.
+   */
+  maxOutgoingFileBytes: number;
+  /**
+   * Inbound merge window (打字合并): consecutive WeChat text messages from the
+   * peer are buffered per chat and delivered as ONE prompt instead of one turn
+   * per message, so a thought typed as five bubbles costs one turn.
+   *
+   * Default `false` — every WeChat message is its own turn unless the operator
+   * opts in (from WeChat with `/merge on`, or in the settings page). Batching
+   * changes what "one turn" MEANS — a turn can then carry several user messages
+   * — and it adds a few seconds of latency per message, which is the wrong
+   * trade for the short imperative commands that dominate this channel. Opt-in
+   * keeps the pre-0.12 one-message-one-turn behaviour on upgrade.
+   */
+  mergeEnabled: boolean;
+  /** Silence window (ms) after the last buffered message before the batch is delivered. `0` disables the window. */
+  mergeSilenceMs: number;
+  /** Hard cap on buffered messages per batch — a defensive bound, never exceeded. */
+  mergeMaxMsgs: number;
+  /**
+   * Suffix tokens inside the message text: a trailing `..` keeps the batch
+   * open (no silence flush), a trailing `!!` commits it immediately. Both are
+   * STRIPPED from the text when the feature is on.
+   */
+  mergeSuffixTokens: boolean;
+  /**
+   * Forced release (ms): the hard ceiling that delivers a batch regardless of
+   * the silence window, a `..` hold, or a still-in-flight previous batch —
+   * "rather two messages in one turn than a permanently blocked channel".
+   * Default 3 minutes.
+   */
+  mergeForcedReleaseMs: number;
+  /**
+   * 图片/文件与文字合并发送 (media + text coalescing).
+   *
+   * Historically a media item NEVER joined a text batch: it flushed the
+   * pending text as its own turn and then went to the agent as a SECOND turn,
+   * so "here is my screenshot, please look at it" required two turns and the
+   * agent answered the image before it had the question.
+   *
+   * With this switch on, a media message that carries NO text of its own is
+   * HELD (nothing is downloaded yet) and delivered together with the text the
+   * user types next, as ONE prompt. A media message that already carries its
+   * own caption still goes straight through: it needs no follow-up sentence.
+   *
+   * Default `false`: an untouched install keeps the 0.12 behaviour exactly
+   * (media is never delayed), because holding an image for a sentence that
+   * never arrives would look like a dropped message.
+   */
+  mediaMergeEnabled: boolean;
+  /**
+   * How long a held media item waits for its text (ms). When the window
+   * elapses the held items are delivered on their own — a picture with no
+   * question still deserves an answer, and "held forever" is not a state a
+   * chat channel may reach. The effective wait is
+   * `min(mediaHoldMs, mergeForcedReleaseMs)`, so the merge window's own
+   * liveness ceiling also bounds this one.
+   *
+   * Default 3 minutes — the same as `mergeForcedReleaseMs`, i.e. by default the
+   * attachment wait IS the merge window's liveness ceiling, the longest a turn
+   * may be held at all.
+   */
+  mediaHoldMs: number;
+  /**
+   * How a saved inbound attachment is SPELLED in the prompt:
+   *
+   *   - `true` — a host `@文件` reference (`@path` / `@"path with spaces"`), the
+   *     exact token the GUI composer produces. The GUI renders an openable
+   *     chip, and `@deepseek-ai/dsh-file-reference-local` tells the model to
+   *     call `read` instead of pretending it inspected the file.
+   *   - `false` (default) — the plain-path wording ("文件已保存到: <abs path>").
+   *
+   * Off by default on purpose: the reference is the nicer spelling, but it is
+   * the one that depends on the host having `dsh-file-reference` mounted, and a
+   * mention that nothing parses degrades to a raw `@C:/…` in the bubble. A plain
+   * path always reads correctly, so the safe spelling is the default and the
+   * chip is opt-in.
+   *
+   * Both are pointers to the same saved file; neither inlines its content.
+   */
+  mediaAtRefEnabled: boolean;
 }
 
 /** Default WeChat surface prompt — injected as a runtime-context snapshot. */
@@ -105,5 +218,20 @@ export function defaultConfig(): WeChatDSHConfig {
     surfacePrompt: DEFAULT_SURFACE_PROMPT,
     sendWechatRateLimitPerMinute: 10,
     allowedUsers: [],
+    allowRemotePermissionEscalation: false,
+    allowAnyFilePath: false,
+    maxOutgoingFileBytes: 20 * 1024 * 1024,
+    mergeEnabled: false,
+    mergeSilenceMs: 3000,
+    mergeMaxMsgs: 10,
+    mergeSuffixTokens: true,
+    mergeForcedReleaseMs: 3 * 60_000,
+    mediaMergeEnabled: false,
+    mediaHoldMs: 3 * 60_000,
+    // Plain path by default: `@文件` only becomes a chip when the host has
+    // `dsh-file-reference` mounted, and an unparsed mention shows the reader a
+    // raw `@C:/…`. A path always reads correctly. The wording is the only thing
+    // this switch changes — neither value inlines content.
+    mediaAtRefEnabled: false,
   };
 }

@@ -4,9 +4,8 @@
  * checks — no runtime imports of `@deepseek-ai/*` packages.
  */
 
-import type { Agent, AgentSession } from "./types.js";
-import { sessionEvents } from "./types.js";
-import type { SessionProjectionService } from "./types.js";
+import type { Agent, AgentSession, AgentSessionLike, SessionProjectionService } from "./types.js";
+import { modelSelectionFromProjection, sessionEvents } from "./types.js";
 import type { BridgeContext } from "./sessions.js";
 
 /** Nominal id of one registered settings namespace (dsh-settings brand). */
@@ -204,6 +203,31 @@ export interface AgentDefaultModelService {
   saveSelection(next: ModelSelection): Promise<void>;
 }
 
+/**
+ * Minimal structural surface of the Host `sessionController` service
+ * (`@deepseek-ai/dsh-api-session-controller`). `selectModel` is the exact
+ * Remote operation the GUI model picker calls: it validates the route,
+ * appends the durable `model/selection` event, installs the Session-local
+ * selection, and saves the deployment default in the background. Calling it
+ * from WeChat is what keeps both surfaces on ONE selection instead of the
+ * bridge maintaining a second, request-only override.
+ */
+export interface SessionControllerService {
+  selectModel?(request: {
+    sessionId: string;
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+  }): Promise<{ selected?: ModelSelection } | undefined>;
+}
+
+/** Outcome of routing one switch through the Host session controller. */
+export type SessionModelSelectionOutcome =
+  | { kind: "host" }
+  /** The deployment composes no session controller (older Host / headless). */
+  | { kind: "unsupported" }
+  | { kind: "error"; message: string };
+
 /** Minimal structural surface of the `permissionPresets` service (dsh-permission-presets). */
 export interface PermissionPresetsService {
   /** Advertised preset names, in table declaration order. */
@@ -270,6 +294,56 @@ export interface SettingsService {
   get?(ns: SettingsNamespace): unknown;
   describe?(): readonly { ns: string; value?: unknown }[];
   update(ns: SettingsNamespace, patch: object): Promise<void>;
+}
+
+/** One session-reference discovery candidate (dsh-session-reference). */
+export interface SessionReferenceCandidate {
+  readonly sessionId: string;
+  /** Mention label: the session's latest title, or its id when untitled. */
+  readonly label: string;
+  /** Presentation title (a subagent's durable creation label wins). */
+  readonly displayTitle?: string;
+  readonly cwd?: string;
+  /** True when the candidate shares the requesting agent's working directory. */
+  readonly sameWorkspace?: boolean;
+  readonly createdAt?: number;
+}
+
+/**
+ * Minimal structural surface of `ctx.sessionReferenceResolver`
+ * (`@deepseek-ai/dsh-session-reference`). Only discovery is consumed:
+ * preparation is the HOST's job at `agent/pre-step`, driven purely by the
+ * canonical mention the bridge stages in the message text. `prepare` is
+ * deliberately not called — invoking it out of band would prepare a snapshot
+ * the host never attaches to a message.
+ */
+export interface SessionReferenceResolverService {
+  listCandidates(
+    agent: Agent,
+    query?: string,
+    limit?: number,
+    signal?: AbortSignal,
+  ): Promise<readonly SessionReferenceCandidate[]>;
+}
+
+/** One file-reference candidate (`ctx.fileReferences.list`). */
+export interface FileReferenceCandidate {
+  /** Workspace-relative path; directories carry no trailing slash here. */
+  readonly path: string;
+  readonly kind: "file" | "directory";
+}
+
+/**
+ * Minimal structural surface of `ctx.fileReferences`
+ * (`@deepseek-ai/dsh-file-reference`). Used by `/at f` only to suggest
+ * near-matches for a path that does not exist.
+ */
+export interface FileReferencesService {
+  list(
+    agent: Agent,
+    query: string,
+    signal: AbortSignal,
+  ): Promise<readonly FileReferenceCandidate[]>;
 }
 
 /** Approximate context occupancy (dsh-token-meter `contextPressure` projection). */
@@ -849,6 +923,67 @@ export class DshOps {
     }
   }
 
+  /**
+   * The Session's host-owned model selection, folded from the
+   * `modelSelection` projection (`next` = the durable selection the next
+   * request should use, `lastUsed` = the selection consumed by the latest
+   * request). This is the same pair the GUI picker reads, so `/status` and
+   * `/reasoning status` stay truthful after either surface switches.
+   * Returns `undefined` when the projection registry is not composed or
+   * the Session has no recorded selection yet.
+   */
+  sessionModelSelection(session: AgentSessionLike | undefined): ModelSelection | undefined {
+    if (!session) return undefined;
+    try {
+      const snapshot = this.sessionProjections()?.snapshot(session);
+      const selected = modelSelectionFromProjection(snapshot?.values?.["modelSelection"]);
+      return selected?.provider && selected.model
+        ? {
+            provider: selected.provider,
+            model: selected.model,
+            ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}),
+          }
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Route one model/effort switch through the Host session controller — the
+   * same `session.selectModel` Remote the GUI picker submits. On success the
+   * Host records `model/selection`, installs the selection for the next
+   * prompt assembly, and updates the default, so the GUI and WeChat see the
+   * same value immediately (and a later GUI switch simply replaces it).
+   *
+   * Older hosts or minimal profiles without that service report
+   * `unsupported`; the caller keeps the legacy in-memory override path.
+   * A controller rejection is reported as `error` rather than silently
+   * falling back, matching the GUI's "unavailable model" behavior.
+   */
+  async selectSessionModel(
+    sessionId: string,
+    selection: ModelSelection,
+  ): Promise<SessionModelSelectionOutcome> {
+    const controller = this.get<SessionControllerService>("sessionController");
+    if (!controller || typeof controller.selectModel !== "function") {
+      return { kind: "unsupported" };
+    }
+    try {
+      await controller.selectModel({
+        sessionId,
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoningEffort !== undefined
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+      });
+      return { kind: "host" };
+    } catch (err) {
+      return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   // ─── Agent presets ───
 
   async listPresets(): Promise<AgentPreset[]> {
@@ -1020,6 +1155,37 @@ export class DshOps {
       console.error(`[dsh-wechat] save busyEnter failed: ${String(err)}`);
       return false;
     }
+  }
+
+  // ─── References (`/at`) ───
+
+  /**
+   * The `ctx.sessionReferenceResolver` service (`@deepseek-ai/dsh-session-
+   * reference`), or `undefined` when the host does not compose it.
+   *
+   * `/at s` needs two things from it: `listCandidates` for discovery and —
+   * more importantly — the guarantee that the mention this bridge stages will
+   * be accepted at `agent/pre-step`. The service is the ONLY consumer of
+   * `dsh-session:` mentions, so its absence means a staged session mention
+   * would be forwarded as literal text and never expanded: the caller must
+   * refuse instead of silently degrading.
+   */
+  sessionReferenceResolver(): SessionReferenceResolverService | undefined {
+    return this.get<SessionReferenceResolverService>("sessionReferenceResolver");
+  }
+
+  /**
+   * The `ctx.fileReferences` discovery seam
+   * (`@deepseek-ai/dsh-file-reference`), or `undefined` when uncomposed.
+   *
+   * `/at f` does not NEED it (a path is valid prompt text on its own — the
+   * provider's job is the model-facing prompt section, which is installed by
+   * whoever mounts the provider). It is used only to suggest near-matches
+   * when the typed path does not exist, so its absence degrades the hint,
+   * never the command.
+   */
+  fileReferences(): FileReferencesService | undefined {
+    return this.get<FileReferencesService>("fileReferences");
   }
 
   // ─── Helpers for cross-session notification recipients ───

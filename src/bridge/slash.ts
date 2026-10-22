@@ -6,12 +6,36 @@
  * Only the commands the DSH bridge handles itself are kept: DSH owns
  * workspace/session/agent/model management in its GUI, so those commands
  * are intentionally absent here.
+ *
+ * This module also owns the two `/help` renderers (`formatHelp` and
+ * `helpTopicBlock`). Their wording is NOT written here — it comes from
+ * `src/help-catalog.ts`, the same catalog the settings page renders, so the
+ * WeChat reply and the GUI panel can never disagree.
  */
+
+import { findHelpEntry, helpCatalog, shortestSpelling } from "../help-catalog.js";
 
 export type HelpCommand = { kind: "help" };
 export type StatusCommand = { kind: "status" };
 export type SilentCommand = { kind: "silent"; mode: "on" | "off" | "status" };
 export type FinalCommand = { kind: "final"; mode: "on" | "off" | "status" };
+export type MergeCommand = { kind: "merge"; mode: "on" | "off" | "status" };
+/**
+ * `/media` — 图片/文件与文字合并发送 + 附件交付措辞.
+ *
+ * One command, two independent switches (whether to hold a caption-less
+ * attachment for the sentence typed next, and how the saved file is spelled in
+ * the prompt), because a user asks for them together ("send the picture AND the
+ * question") and splitting them across two commands would make neither
+ * discoverable.
+ *
+ * `at|path` changes the SPELLING only: `adapter/inbound.ts` hands over a pointer
+ * in both cases and never inlines the file's content.
+ */
+export type MediaCommand =
+  | { kind: "media"; target: "merge"; mode: "on" | "off" }
+  | { kind: "media"; target: "ref"; style: "at" | "path" }
+  | { kind: "media"; target: "status" };
 export type SurfaceCommand = { kind: "surface"; mode: "on" | "off" | "status" };
 export type StopCommand = { kind: "stop" };
 export type RejectQuestionCommand = { kind: "reject-question" };
@@ -28,14 +52,40 @@ export type SlashCommand =
   | StatusCommand
   | SilentCommand
   | FinalCommand
+  | MergeCommand
+  | MediaCommand
   | StopCommand
   | RejectQuestionCommand
   | RejectPermissionCommand;
 
-/** Parse `/help` (aliases `/h`, `/?`). */
-export function parseHelpCommand(text: string): boolean {
-  const trimmed = text.trim().toLowerCase();
-  return trimmed === "/help" || trimmed === "/h" || trimmed === "/?";
+/**
+ * Parse `/help` (aliases `/h`, `/?`), optionally with a command name.
+ *
+ *   /help                 → `true`   (the listing)
+ *   /help s               → `{ topic: "s" }`  (that command's examples)
+ *   /help session         → `{ topic: "session" }`
+ *   /help fuck            → `{ unknown: "fuck" }` (listing + "没有这条命令")
+ *   /help me write a test → `{ unknown: "me write a test" }` (same)
+ *
+ * Everything after `/help` is a COMMAND NAME, so a line that does not resolve
+ * to a documented command is still a help request: it gets "没有 /xxx 这条命令"
+ * plus the listing, never a forwarded sentence. Forwarding it would answer a
+ * help request with "未知命令 /help", which is the one reply guaranteed to be
+ * wrong — the user is asking for help. This matches `man`, which answers an
+ * unknown page with an error and its own usage instead of ignoring the word.
+ *
+ * The only non-help shape left is `/help` followed by NOTHING but whitespace,
+ * which is the plain listing.
+ */
+export function parseHelpCommand(
+  text: string,
+): boolean | { topic: string } | { unknown: string } {
+  const trimmed = text.trim();
+  const m = trimmed.match(/^\/(?:help|h|\?)(?:\s+(.*))?$/i);
+  if (!m) return false;
+  const rest = (m[1] ?? "").trim();
+  if (!rest) return true;
+  return findHelpEntry(rest) ? { topic: rest } : { unknown: rest };
 }
 
 /** Parse `/status`. */
@@ -75,6 +125,50 @@ export function parseFinalCommand(text: string): FinalCommand | null {
   const m = trimmed.match(/^\/(?:final|fo)\s+(on|off|status)\s*$/);
   if (!m) return null;
   return { kind: "final", mode: m[1] as "on" | "off" | "status" };
+}
+
+/**
+ * Parse `/merge` (alias `/mg`) — query or toggle the inbound merge window
+ * (打字合并). Bare command defaults to status.
+ *
+ * The alias must not collide with an existing name: `/m` is NOT used (it
+ * would be the shortest but is not obviously "merge"), and `/mg` is free —
+ * `tests/merge-window.test.ts` asserts the whole alias table for collisions.
+ */
+export function parseMergeCommand(text: string): MergeCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/merge" || trimmed === "/mg") {
+    return { kind: "merge", mode: "status" };
+  }
+  const m = trimmed.match(/^\/(?:merge|mg)\s+(on|off|status)\s*$/);
+  if (!m) return null;
+  return { kind: "merge", mode: m[1] as "on" | "off" | "status" };
+}
+
+/**
+ * Parse `/media` (alias `/md`) — 图片/文件与文字合并发送, plus how a saved
+ * attachment is spelled in the prompt:
+ *
+ *   /media                    → status (both switches + the current wording)
+ *   /media on|off             → hold a caption-less image/file/video and send
+ *                               it together with the text typed next
+ *   /media at|path            → `@路径` reference (default) vs. the plain-path
+ *                               "文件已保存到: 路径" wording — SPELLING only,
+ *                               neither inlines the file's content
+ *
+ * `/md` is safe: `/m`, `/mo` and `/me` are already taken or ambiguous, while
+ * `/md` collides with nothing in `LOCAL_COMMAND_NAMES` (asserted by the alias
+ * guard in tests/media-merge.test.ts).
+ */
+export function parseMediaCommand(text: string): MediaCommand | null {
+  const trimmed = text.trim().toLowerCase();
+  if (trimmed === "/media" || trimmed === "/md") return { kind: "media", target: "status" };
+  const m = trimmed.match(/^\/(?:media|md)\s+(on|off|status|at|path)\s*$/);
+  if (!m) return null;
+  const sub = m[1]!;
+  if (sub === "on" || sub === "off") return { kind: "media", target: "merge", mode: sub };
+  if (sub === "at" || sub === "path") return { kind: "media", target: "ref", style: sub };
+  return { kind: "media", target: "status" };
 }
 
 /**
@@ -186,10 +280,38 @@ export function parseRejectPermissionCommand(text: string): RejectPermissionComm
   return null;
 }
 
-/** Detect an unknown leading-slash command for the hint reply. */
+/**
+ * Detect an unknown leading-slash command for the hint reply.
+ *
+ * Returns null for a name this plugin owns. "/help fuck" answering "未知命令
+ * /help" is the one reply guaranteed to be wrong — the user is literally
+ * asking for help — and the same holds for a documented command with a bad
+ * argument (`/model foo`), where `commandUsageHint` answers instead.
+ */
 export function detectUnknownSlashCommand(text: string): string | null {
   const m = text.trim().match(/^\/[a-zA-Z][a-zA-Z0-9-]*/);
-  return m ? m[0] : null;
+  if (!m) return null;
+  return LOCAL_COMMAND_NAMES.has(m[0].slice(1).toLowerCase()) ? null : m[0];
+}
+
+/**
+ * Usage line for a DOCUMENTED command whose arguments did not parse.
+ *
+ * `/model foo` is not an unknown command — `/model` is printed in the `/help`
+ * listing, so answering "未知命令 /model" contradicts what the user just read.
+ * The command exists; the argument is wrong, and the reply has to say which
+ * argument it wanted. Bare commands never reach here (every parser handles
+ * them), and `/help <文字>` is excluded because that is a question for the
+ * agent, not a syntax error.
+ */
+export function commandUsageHint(text: string): string | null {
+  const trimmed = text.trim();
+  const m = trimmed.match(/^\/([a-zA-Z][a-zA-Z0-9-]*)\s+([\s\S]*)$/);
+  if (!m) return null;
+  const entry = findHelpEntry(m[1]!);
+  if (!entry) return null;
+  if (entry.id === "help") return null;
+  return `⚠️ 用法: ${entry.usage}`;
 }
 
 /**
@@ -337,12 +459,19 @@ function parseListLimit(tokens: string[]): { limit?: number; all?: boolean } | u
 
 /**
  * Parse `/workspace` (alias `/ws`):
- *   list [all|<数量>] | status | switch <path|n> | add <path>
+ *   (bare) | list [all|<数量>] | status | switch <path|n> | add <path>
+ *
+ * Bare `/ws` reports status, the same shape every other management command
+ * uses (`/reasoning`, `/enter`, `/notify`, `/surface`). It used to parse to
+ * `null`, which made the bridge answer "未知命令 /workspace" for a command the
+ * `/help` listing documents two lines above — the most confusing possible
+ * reply, because the user just read the name there.
  */
 export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
   const trimmed = text.trim();
-  const m = trimmed.match(/^\/(?:workspace|ws)\s+(list|status|switch|add)(?:\s+(.*))?$/);
+  const m = trimmed.match(/^\/(?:workspace|ws)(?:\s+(list|status|switch|add)(?:\s+(.*))?)?$/);
   if (!m) return null;
+  if (!m[1]) return { kind: "status" };
   const sub = m[1] as "list" | "status" | "switch" | "add";
   const rest = (m[2] ?? "").trim();
   switch (sub) {
@@ -377,8 +506,10 @@ export function parseWorkspaceCommand(text: string): WorkspaceCommand | null {
  */
 export function parseSessionCommand(text: string): SessionCommand | null {
   const trimmed = text.trim();
-  const m = trimmed.match(/^\/(?:session|s)\s+(list|switch|new|status|pin|unpin)(?:\s+(.*))?$/);
+  const m = trimmed.match(/^\/(?:session|s)(?:\s+(list|switch|new|status|pin|unpin)(?:\s+(.*))?)?$/);
   if (!m) return null;
+  // Bare `/s` reports status, like every other management command.
+  if (!m[1]) return { kind: "status" };
   const sub = m[1] as "list" | "switch" | "new" | "status" | "pin" | "unpin";
   const rest = (m[2] ?? "").trim();
   switch (sub) {
@@ -427,8 +558,9 @@ export function parseSessionCommand(text: string): SessionCommand | null {
  */
 export function parsePresetCommand(text: string): PresetCommand | null {
   const trimmed = text.trim();
-  const m = trimmed.match(/^\/(?:preset|p|agent|a)\s+(list|switch|status)(?:\s+(.*))?$/);
+  const m = trimmed.match(/^\/(?:preset|p|agent|a)(?:\s+(list|switch|status)(?:\s+(.*))?)?$/);
   if (!m) return null;
+  if (!m[1]) return { kind: "status" };
   const sub = m[1] as "list" | "switch" | "status";
   const rest = (m[2] ?? "").trim();
   switch (sub) {
@@ -452,8 +584,11 @@ export function parsePresetCommand(text: string): PresetCommand | null {
  */
 export function parseModelCommand(text: string): ModelCommand | null {
   const trimmed = text.trim();
-  const m = trimmed.match(/^\/(?:model)\s+(list|switch|status)(?:\s+(.*))?$/);
+  const m = trimmed.match(/^\/(?:model)(?:\s+(list|switch|status)(?:\s+(.*))?)?$/);
   if (!m) return null;
+  // Bare `/model` reports the current model — the single most likely thing a
+  // user types, and it used to be answered with "未知命令 /model".
+  if (!m[1]) return { kind: "status" };
   const sub = m[1] as "list" | "switch" | "status";
   const rest = (m[2] ?? "").trim();
   switch (sub) {
@@ -507,8 +642,9 @@ export function splitProviderModelTarget(
  */
 export function parsePermCommand(text: string): PermCommand | null {
   const trimmed = text.trim();
-  const m = trimmed.match(/^\/(?:perm|permission)\s+(list|status|switch|default)(?:\s+(.*))?$/);
+  const m = trimmed.match(/^\/(?:perm|permission)(?:\s+(list|status|switch|default)(?:\s+(.*))?)?$/);
   if (!m) return null;
+  if (!m[1]) return { kind: "status" };
   const sub = m[1] as "list" | "status" | "switch" | "default";
   const rest = (m[2] ?? "").trim();
   switch (sub) {
@@ -587,6 +723,62 @@ export const HISTORY_MAX = 20;
 
 export type HistoryCommand = { kind: "history"; count: number; includeSystem: boolean };
 
+// ─── /at: reference another session or a file ───────────────────────────────
+
+/**
+ * `/at` (引用) — the WeChat stand-in for the GUI composer's `@` completion.
+ *
+ * WeChat has no composer attachment surface, so a reference cannot be
+ * inserted at a caret. Instead `/at` STAGES a reference and the next message
+ * delivered to the agent carries it: the model then sees the same tokens the
+ * GUI would have produced (`@[标题](dsh-session:…)` for a session, `@path` /
+ * `@"path with spaces"` for a file).
+ *
+ *   /at                      → list what is staged
+ *   /at s <编号|关键词>       → stage another session (by /s list row or a substring)
+ *   /at f <路径>              → stage a file or directory
+ *   /at rm <编号>             → drop one staged reference
+ *   /at clear                → drop every staged reference
+ *
+ * `target` is the raw rest-of-line: a path may contain spaces, and the caller
+ * strips one pair of surrounding quotes (the `@"…"` spelling the GUI shows).
+ */
+export type AtCommand =
+  | { kind: "list" }
+  | { kind: "clear" }
+  | { kind: "remove"; index: number }
+  | { kind: "session"; target: string }
+  | { kind: "file"; target: string };
+
+export function parseAtCommand(text: string): AtCommand | null {
+  const trimmed = text.trim();
+  const m = trimmed.match(/^\/at(?:\s+(.*))?$/i);
+  if (!m) return null;
+  const rest = (m[1] ?? "").trim();
+  if (!rest || /^(?:list|ls)$/i.test(rest)) return { kind: "list" };
+  if (/^(?:clear|reset)$/i.test(rest)) return { kind: "clear" };
+  const remove = rest.match(/^(?:rm|remove)\s+(\d+)$/i);
+  if (remove) {
+    const index = parseInt(remove[1]!, 10);
+    return Number.isFinite(index) && index > 0 ? { kind: "remove", index } : null;
+  }
+  const sub = rest.match(/^(s|session|f|file)(?:\s+([\s\S]*))?$/i);
+  if (!sub) return null;
+  const target = (sub[2] ?? "").trim();
+  return sub[1]!.toLowerCase().startsWith("s")
+    ? { kind: "session", target }
+    : { kind: "file", target };
+}
+
+/**
+ * True if text looks like an `/at` attempt (including an invalid argument),
+ * used to decide whether to show usage instead of forwarding to the agent —
+ * the same contract as {@link isHistoryCommandAttempt}.
+ */
+export function isAtCommandAttempt(text: string): boolean {
+  return /^\s*\/at\b/i.test(text);
+}
+
 /**
  * Parse `/history [all] [N]` — view recent conversation history.
  *   /history            → 5 human+assistant turns (default)
@@ -663,11 +855,18 @@ export function isHistoryCommandAttempt(text: string): boolean {
 export function isBypassSlashCommand(text: string): boolean {
   if (!text) return false;
   return (
-    parseHelpCommand(text) ||
+    // `parseHelpCommand` returns `true` for the listing, `{ topic }` for
+    // `/help <命令>`, and `{ unknown }` for `/help <不存在的名字>`; all three
+    // are help requests and bypass a pending card, so compare against `false`
+    // instead of truthiness (an object here would make this function's return
+    // type leak a non-boolean).
+    parseHelpCommand(text) !== false ||
     parseNextCommand(text) ||
     parseFlushCommand(text) ||
     parseSilentCommand(text) !== null ||
     parseFinalCommand(text) !== null ||
+    parseMergeCommand(text) !== null ||
+    parseMediaCommand(text) !== null ||
     parseSurfaceCommand(text) !== null ||
     parseStatusCommand(text) !== null ||
     parseWorkspaceCommand(text) !== null ||
@@ -679,6 +878,12 @@ export function isBypassSlashCommand(text: string): boolean {
     parseEnterCommand(text) !== null ||
     parseNotifyCommand(text) !== null ||
     parseHistoryCommand(text) !== null ||
+    // `/at` bypasses on the ATTEMPT, not just a valid parse: a mistyped
+    // `/at s` is never a plausible answer to a permission/question card, and
+    // swallowing it as one would both drop the user's intent and leave the
+    // card's own semantics untouched. `/history` keeps the stricter
+    // valid-parse rule it has always had.
+    isAtCommandAttempt(text) ||
     parseStopCommand(text) !== null
   );
 }
@@ -693,6 +898,11 @@ export function isBypassSlashCommand(text: string): boolean {
  */
 export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "help",
+  // `/h` is a documented alias of `/help` (see `parseHelpCommand`). It has to
+  // be listed here too: `tryNativeCommand` runs BEFORE the local `/help`
+  // branch, so without it a host command named `h` would silently shadow the
+  // alias — the user types `/h` and gets someone else's command.
+  "h",
   "status",
   "workspace",
   "ws",
@@ -712,6 +922,10 @@ export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "sl",
   "final",
   "fo",
+  "merge",
+  "mg",
+  "media",
+  "md",
   "surface",
   "wxprompt",
   "stop",
@@ -719,6 +933,7 @@ export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "flush",
   "f",
   "history",
+  "at",
   "rp",
   "reject-permission",
   "rq",
@@ -728,46 +943,132 @@ export const LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "notice",
 ]);
 
+/**
+ * Terminal display width of one code point: 2 for full-width CJK, 1 otherwise.
+ *
+ * Used to align the help tables. WeChat renders a fenced block in a monospace
+ * box, where a CJK glyph occupies exactly two ASCII columns — padding by
+ * `String.length` would leave the columns visibly ragged.
+ */
+function charWidth(code: number): number {
+  if (code < 0x1100) return 1;
+  return code === 0x2018 || code === 0x2019 || code === 0x201c || code === 0x201d
+    ? 2
+    : code >= 0x1100 &&
+        (code <= 0x115f ||
+          code === 0x2329 ||
+          code === 0x232a ||
+          (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+          (code >= 0xac00 && code <= 0xd7a3) ||
+          (code >= 0xf900 && code <= 0xfaff) ||
+          (code >= 0xfe30 && code <= 0xfe6f) ||
+          (code >= 0xff00 && code <= 0xff60) ||
+          (code >= 0xffe0 && code <= 0xffe6) ||
+          (code >= 0x1f300 && code <= 0x1f9ff) ||
+          (code >= 0x20000 && code <= 0x3fffd))
+      ? 2
+      : 1;
+}
+
+/** Display width of a whole string (see {@link charWidth}). */
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += charWidth(ch.codePointAt(0) ?? 0);
+  return width;
+}
+
+/** Right-pad `text` to `width` display columns (never truncates). */
+function padTo(text: string, width: number): string {
+  const pad = width - displayWidth(text);
+  return pad > 0 ? text + " ".repeat(pad) : text;
+}
+
+/**
+ * Render `[head, note]` pairs as an aligned monospace table inside a fence.
+ *
+ * Why a fence instead of a Markdown list: a WeChat bubble does not scroll
+ * horizontally, so a long `- `/s switch 3` — …` line WRAPS, and the wrap lands
+ * in the middle of the backticked command (`…（编号看 /` + `s list）`), which
+ * turns one copy-pasteable line into two broken halves. A fenced block renders
+ * in the scrollable monospace box the client already uses for code, so each
+ * row stays on one line.
+ */
+function fenceTable(rows: ReadonlyArray<readonly [string, string]>, indent = 0): string[] {
+  const width = rows.reduce((max, [head]) => Math.max(max, displayWidth(head)), 0);
+  const pad = " ".repeat(indent);
+  const out = ["```"];
+  for (const [head, note] of rows) out.push(`${pad}${padTo(head, width)}  ${note}`.trimEnd());
+  out.push("```");
+  return out;
+}
+
 /** The /help reply, optionally augmented with native command descriptors. */
 export function formatHelp(
   nativeCommands?: ReadonlyArray<{ name: string; description?: string; input?: { hint?: string } }>,
 ): string {
-  const lines: string[] = [
-    "🤖 DSH 微信助手 — 命令列表",
-    "",
-    "• /help (h, ?) — 显示帮助",
-    "• /status — 当前会话、工作区、Agent、待处理卡、默认/当前会话 Preset、模型状态",
-    "• /workspace (ws) — list [all|<数量>] | status | switch <路径|编号> | add <路径>（默认显示 20 个）",
-    "• /session (s) — list [current] [all|<数量>] | switch [current] <编号> | pin [编号] | unpin [编号] | new | status（默认显示 20 个；pin/unpin 省略编号时作用于当前会话）",
-    "• /preset (p) — list | switch <名称|编号> | status（默认 preset，与 GUI 同步；status 看全局默认，不是当前会话）",
-    "• /model — list [提供商] | switch <提供商/模型> | status",
-    "• /perm (permission) — status | list | switch <名称|编号> | default [名称|编号]（会话权限实时切换；默认写入 DSH 设置，与 GUI 同步）",
-    "• /reasoning — 查看/设置推理等级：/reasoning [list|default|switch <等级>]",
-    "• /enter (busy) — queue|steer|status 繁忙时消息投递（排队/插话，与 DSH 设置「繁忙时 Enter 键行为」同步）",
-    "• /silent on|off (sl) — 开启仅每轮最终回复；关闭显示合并的思考与工具执行过程",
-    "• /final on|off (fo) — 结论模式：跨轮次暂存，整条任务停下后只发一条最终结论（优先于 /silent）",
-    "• /flush (f) — 立即取回结论模式暂存的最终结论，不必等静默期",
-    "• /surface on|off|status (wxprompt) — 微信渠道提示词注入开关（默认关；正文在设置页编辑）",
-    "• /notify on|off|status (watch) — 跨会话决策推送：权限/提问卡整卡（默认关闭）；/notify tasks on|off 跨会话任务完成提醒",
-    "• /history [all] [数量] — 查看最近历史（默认 5 条，最多 20 条；默认只看你和助手，all 含压缩/注入等系统消息）；有待处理卡时会完整重发",
-    "• /stop — 中断当前任务",
-    "• /next — 继续发送因微信限制被缓存的消息",
-    "• /rq — 关闭当前会话的待处理卡；其它会话用 P1=/rq",
-  ];
-  if (nativeCommands && nativeCommands.length > 0) {
-    lines.push("", "── DSH 原生命令（当前 profile 已注册）──");
-    for (const cmd of nativeCommands) {
-      if (LOCAL_COMMAND_NAMES.has(cmd.name)) continue;
-      const desc = cmd.description?.trim() || "(未提供说明)";
-      const hint = cmd.input?.hint ? `  ${cmd.input.hint}` : "";
-      lines.push(`• /${cmd.name}${hint} — ${desc}`);
+  const catalog = helpCatalog();
+  const rows: Array<[string, string]> = [];
+  for (const entry of catalog.commands) {
+    const alias = entry.aliases.length > 0 ? ` (${entry.aliases.join(", ")})` : "";
+    rows.push([`${entry.command}${alias}`, entry.summary]);
+    if (entry.subcommands.length > 0) {
+      const short = shortestSpelling(entry);
+      // The subcommand row hangs under its command, aligned with the notes.
+      rows.push(["", entry.subcommands.map((sub) => `${short} ${sub}`).join("、")]);
     }
   }
-  lines.push(
+  const native: Array<[string, string]> = [];
+  for (const cmd of nativeCommands ?? []) {
+    if (LOCAL_COMMAND_NAMES.has(cmd.name)) continue;
+    const desc = cmd.description?.trim() || "(未提供说明)";
+    const hint = cmd.input?.hint ? `  ${cmd.input.hint}` : "";
+    native.push([`/${cmd.name}${hint}`, desc]);
+  }
+  const lines: string[] = [
+    "# DSH 微信助手 · 指令帮助",
     "",
-    "权限审批完全走 DSH 原生机制（沙箱升级触发），GUI 与微信双端同卡，谁先回复谁生效。",
-    "其他 /xxx 命令会作为文本转发给 agent。",
+    "查看某条命令的例子：`/help s`、`/help workspace`",
+    "",
+    ...fenceTable(rows),
+  ];
+  if (native.length > 0) {
+    // The native section keeps its own `── … ──` banner and `• /name` rows:
+    // it is generated from the host's descriptors, not from this catalog.
+    lines.push(
+      "",
+      "```",
+      "── DSH 原生命令（当前 profile 已注册）──",
+      ...native.map(([head, desc]) => `• ${head} — ${desc}`),
+      "```",
+    );
+  }
+  lines.push("", "其他 /xxx 会作为文本转给 agent。");
+  return lines.join("\n");
+}
+
+/**
+ * One command's full example list, for WeChat `/help <命令>`.
+ *
+ * Every example the settings panel shows is listed here too, in the same order
+ * and with the same `note` — so a user who reads `/help s` in WeChat sees
+ * exactly what the panel's `/session` row expands to.
+ *
+ * @param topic Command name or any alias, with or without the leading slash.
+ * @returns The block, or `null` when `topic` is not a documented command (the
+ *   caller then shows the listing instead of inventing an answer).
+ */
+export function helpTopicBlock(topic: string): string | null {
+  const entry = findHelpEntry(topic);
+  if (!entry) return null;
+  const lines: string[] = [`# ${entry.command} — ${entry.summary}`];
+  if (entry.aliases.length > 0) {
+    const aliases = entry.aliases.map((alias) => `\`/${alias}\``).join("、");
+    lines.push("", `也可以写成：${aliases}`);
+  }
+  const rows = entry.examples.map(
+    (example) => [example.line, example.note] as readonly [string, string],
   );
+  lines.push("", ...fenceTable(rows), "", "发 `/help` 看其它命令。");
   return lines.join("\n");
 }
 

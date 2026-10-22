@@ -62,7 +62,7 @@ describe("parseEnterCommand", () => {
     expect(isBypassSlashCommand("/enter queue")).toBe(true);
     expect(isBypassSlashCommand("/busy steer")).toBe(true);
     expect(isBypassSlashCommand("/enter bogus")).toBe(false);
-    expect(formatHelp()).toContain("/enter (busy)");
+    expect(formatHelp()).toContain("/enter ");
   });
 });
 
@@ -111,6 +111,10 @@ function makeBridge(
   };
   const cfg = defaultConfig();
   cfg.storageDir = dir;
+  // This suite is about busy-Enter delivery, not about the inbound merge
+  // window: a 0ms window dispatches every message immediately, which is the
+  // one-turn-per-message behaviour these cases assert.
+  cfg.mergeSilenceMs = 0;
   const bridge = new WeChatDSHBridge(ctx, cfg);
   (bridge as unknown as { token: unknown }).token = {
     baseUrl: "https://gw",

@@ -16,6 +16,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { login, loadToken, type TokenData } from "../weixin/auth.js";
 import { startMonitor, clearSyncBuf } from "../weixin/monitor.js";
 import { sendTextMessage, sendMediaMessage, splitText } from "../weixin/send.js";
@@ -26,9 +27,9 @@ import {
   isMessageLimitError,
   isSessionTimeoutError,
 } from "../weixin/api.js";
-import { MessageType, TypingStatus, UploadMediaType } from "../weixin/types.js";
+import { MessageItemType, MessageType, TypingStatus, UploadMediaType } from "../weixin/types.js";
 import type { WeixinMessage } from "../weixin/types.js";
-import { extractText, weixinMessageToPrompt } from "../adapter/inbound.js";
+import { extractText, findMediaItem, isHoldableMediaItem, weixinMessageToPrompt } from "../adapter/inbound.js";
 import { formatForWeChat } from "../adapter/outbound.js";
 import { ExecutionProcess } from "../adapter/process-format.js";
 import type { AssistantStreamFrame, OutputContentBlock, ToolCallData, ToolResultData } from "../dsh/types.js";
@@ -36,8 +37,8 @@ import { formatQuestionForWeChat, parseQuestionReply, buildAnswer } from "../ada
 import { formatApprovalCard, parseApprovalReply } from "../adapter/approval-format.js";
 import { AgentStore, type BridgeContext } from "../dsh/sessions.js";
 import { DshOps } from "../dsh/ops.js";
-import type { ModelSelection, PinOutcome, SessionRecord } from "../dsh/ops.js";
-import type { Agent, AskUserQuestionAnswer, AskUserQuestionItem } from "../dsh/types.js";
+import type { ModelSelection, PinOutcome, SessionHeader, SessionRecord } from "../dsh/ops.js";
+import type { Agent, AgentSessionLike, AskUserQuestionAnswer, AskUserQuestionItem } from "../dsh/types.js";
 import { sessionEvents } from "../dsh/types.js";
 import {
   MAX_OUTBOUND_QUEUE,
@@ -47,23 +48,31 @@ import {
   type UserState,
 } from "../state.js";
 import type { WeChatDSHConfig } from "../config.js";
+import { defaultConfig } from "../config.js";
 import { EDITABLE_KEYS, type ConfigStore, type EditableConfig } from "../config-store.js";
-import { maskSecrets } from "../utils/redact.js";
+import { maskSecrets, maskUserId } from "../utils/redact.js";
+import { AuditLog } from "../utils/audit.js";
 import {
+  commandUsageHint,
   detectUnknownSlashCommand,
   formatHelp,
+  helpTopicBlock,
+  isAtCommandAttempt,
   isBypassSlashCommand,
   isHistoryCommandAttempt,
+  parseAtCommand,
   parseCommandName,
   parseHelpCommand,
   parseHistoryCommand,
   renderProjectionSection,
   parseEnterCommand,
   parseFinalCommand,
+  parseMergeCommand,
   parseModelCommand,
   splitProviderModelTarget,
   parseNextCommand,
   parseFlushCommand,
+  parseMediaCommand,
   parseNotifyCommand,
   parsePermCommand,
   parsePresetCommand,
@@ -81,9 +90,12 @@ import {
   HISTORY_MAX,
   LIST_DEFAULT,
   LOCAL_COMMAND_NAMES,
+  type AtCommand,
   type EnterCommand,
   type FinalCommand,
   type HistoryCommand,
+  type MergeCommand,
+  type MediaCommand,
   type ModelCommand,
   type NotifyCommand,
   type SurfaceCommand,
@@ -93,6 +105,14 @@ import {
   type SessionCommand,
   type WorkspaceCommand,
 } from "./slash.js";
+import {
+  buildMentionBlock,
+  formatFileMention,
+  formatSessionMention,
+  hasInvisibleMarks,
+  normalizeAtTarget,
+  type StagedReference,
+} from "./at-refs.js";
 
 /** WeChat gateway continuous-message limit per user interaction window. */
 const MSG_LIMIT_MAX = 10;
@@ -109,6 +129,37 @@ const INBOUND_TTL_MS = 30 * 60_000;
 const INBOUND_MAX_SEEN = 4096;
 /** How long a session's message-source marker stays valid without a touch. */
 const SURFACE_TTL_MS = 7 * 24 * 60 * 60_000;
+/**
+ * Bounded wait for the outbound serialization slot (R1). A single hung
+ * outbound operation must not wedge every later send forever: when the
+ * predecessor does not settle within this window, the waiter logs loudly and
+ * proceeds WITHOUT the slot (the alternative — waiting forever — is the
+ * failure this bound exists to prevent). 30s is far above any real gateway
+ * call (the send itself has its own HTTP timeout) and far below "wedged".
+ */
+const OUTBOUND_SLOT_WAIT_MS = 30_000;
+/**
+ * Hard caps for the per-session memo maps (R2). These are caches, not queues:
+ * nothing is lost when an entry is evicted (a preview simply shows the session
+ * id instead of a quoted tail, `/s list` falls back to the session's creation
+ * time, a model override falls back to the deployment default). The caps are
+ * insertion-ordered FIFO — deterministic and allocation-free — rather than
+ * true LRU: the readers are `/s list` (a window over the roster) and `/status`
+ * (one row), so read-recency would not predict what is needed next.
+ */
+const ASSISTANT_PREVIEW_MAX_SESSIONS = 64;
+const ACTIVITY_MAX_SESSIONS = 512;
+const MODEL_OVERRIDE_MAX_SESSIONS = 128;
+/**
+ * One-shot TTL for a WeChat-injected message id. The mark is consumed by the
+ * `user/message` echo; an echo that never arrives (turn cancelled, agent
+ * never claimed the inbox item) must not pin the id for the process lifetime.
+ * Generous because queue-mode delivery can take minutes while the agent is
+ * busy — dropping the mark early would mislabel the next turn as GUI-driven
+ * and silently drop the WeChat surface prompt for it.
+ */
+const WECHAT_MSG_ID_TTL_MS = 10 * 60_000;
+const WECHAT_MSG_IDS_MAX = 512;
 /** typing_ticket cache TTL — re-fetch via getconfig after expiry. */
 const TYPING_TICKET_TTL_MS = 5 * 60_000;
 /**
@@ -143,6 +194,58 @@ export interface LoginState {
 
 /** Closed approval outcomes the Host waterfall accepts. */
 export type ApprovalOutcome = "allowed-once" | "rejected" | "cancelled" | "unavailable";
+
+/**
+ * `/at` references staged for the next message.
+ *
+ * Kept as two ordered lists rather than one mixed list so the numbering `/at`
+ * prints (sessions first, then files) is stable while either kind is added or
+ * removed, and so the two host-side limits stay independent: the session limit
+ * mirrors `MAX_REFERENCES` in `@deepseek-ai/dsh-session-reference` (a message
+ * citing four sessions is REJECTED there and fails the whole turn), while the
+ * file limit is this bridge's own readability bound.
+ */
+interface PendingRefsState {
+  sessions: StagedSessionRef[];
+  files: StagedFileRef[];
+  /** Last staging/removal time — the TTL is measured from here. */
+  at: number;
+}
+
+/** One staged session reference: the id it names plus its prompt mention. */
+interface StagedSessionRef {
+  sessionId: string;
+  /** Display title used in `/at` and in the mention's label. */
+  label: string;
+  /** `@[label](dsh-session:…)` — the exact token the host parses. */
+  mention: string;
+}
+
+/** One staged file reference: workspace-relative (or absolute) path + mention. */
+interface StagedFileRef {
+  /** Path as shown to the user and sent to the model. */
+  path: string;
+  kind: "file" | "directory";
+  /** `@path` or `@"path with spaces"`. */
+  mention: string;
+}
+
+/**
+ * Maximum sessions staged at once. `@deepseek-ai/dsh-session-reference`
+ * accepts at most `MAX_REFERENCES = 3` per message and THROWS
+ * `SESSION_REFERENCE_TOO_MANY` otherwise — which aborts the agent turn — so
+ * the bridge refuses the fourth reference at `/at` time, where the user can
+ * still act on it.
+ */
+const AT_SESSION_LIMIT = 3;
+/** Maximum files staged at once (readability bound, not a host contract). */
+const AT_FILE_LIMIT = 8;
+/**
+ * How long staged references survive without a message. Long enough for a
+ * user to look something up and type a paragraph, short enough that an
+ * abandoned `/at` cannot ambush an unrelated message an hour later.
+ */
+const AT_TTL_MS = 10 * 60_000;
 
 /**
  * Host `approval/request` waterfall payload (structural). `agent.id` is the
@@ -207,6 +310,50 @@ interface PendingFinal {
   /** Hard ceiling timer: fires `finalOnlyCeilingMs` after `firstAt`. */
   ceiling?: NodeJS.Timeout;
 }
+
+/**
+ * Per-chat merge state (打字合并 + 图片/文件合并).
+ *
+ * Entries are appended in arrival order and assembled into ONE prompt. A plain
+ * TEXT entry is buffered by the 打字合并 window; a MEDIA entry is a caption-less
+ * image/file/video held only when `mediaMergeEnabled` is on (`mediaHoldMs`),
+ * and it never downloads at buffer time — the bytes are fetched when the batch
+ * is actually delivered, so a batch that is dropped (identity change, plugin
+ * dispose before delivery) leaves no file behind and no network round trip.
+ *
+ * `newestSourceAt` is the newest message timestamp seen (or arrival time when
+ * iLink supplied none) and exists for exactly one rule: an OUT-OF-ORDER older
+ * message must not extend the silence timer — otherwise a late replay could
+ * hold a batch open indefinitely while the user waits.
+ *
+ * `silence` is absent while a `..` suffix holds the batch open; `ceiling` is
+ * the forced release that always exists, so no batch can outlive
+ * {@link WeChatDSHBridge.mergeForcedReleaseMs} regardless of suffixes,
+ * message storms or a previous batch that never settles. `mediaTimer` is the
+ * attachment-specific wait (its own, shorter default) and is cleared on every
+ * flush path together with the other two.
+ */
+interface MergeState {
+  userId: string;
+  entries: MergeEntry[];
+  /** Newest source timestamp seen (the out-of-order guard compares against it). */
+  newestSourceAt: number;
+  /** When the batch opened — reported by `/merge status` (never write-only). */
+  firstAt: number;
+  silence?: NodeJS.Timeout;
+  ceiling?: NodeJS.Timeout;
+  /** Attachment wait deadline (`mediaHoldMs`); only armed while a media entry is buffered. */
+  mediaTimer?: NodeJS.Timeout;
+  /** `..` seen: keep appending, no silence flush until the cap/`!!`/ceiling. */
+  holdOpen: boolean;
+  /** In-flight dispatch of this chat's previous batch (ordering barrier). */
+  inFlight: Promise<void> | null;
+}
+
+/** One buffered item: the user's words, or an attachment waiting for them. */
+type MergeEntry =
+  | { kind: "text"; text: string; at: number }
+  | { kind: "media"; msg: WeixinMessage; at: number };
 
 /**
  * One pending approval card mirrored from an `approval/request`.
@@ -391,6 +538,13 @@ export class WeChatDSHBridge {
    */
   private peerUserId: string | null = null;
   /**
+   * Peer id written into `allowedUsers` by the S3 upgrade seeding, until its
+   * one-time notice has been delivered (see {@link notifyAllowlistSeed}).
+   * Reading it is what makes the notice exactly-once instead of once per
+   * inbound message.
+   */
+  private allowlistSeededPeer: string | null = null;
+  /**
    * Latest inbound iLink `context_token` for the peer. Wired into the
    * send payload when present; never used as a send gate.
    */
@@ -447,19 +601,48 @@ export class WeChatDSHBridge {
   private capFlushes = 0;
   /** Serializes all outbound budget/queue mutations across assistant and tool sends. */
   private outboundSerial: Promise<void> = Promise.resolve();
+  /**
+   * Marks the async call chain of the body currently holding the outbound
+   * slot. `AsyncLocalStorage` (rather than a boolean) is what makes the
+   * re-entrancy check exact: an unrelated caller that merely ARRIVES while
+   * the slot is held is legitimate FIFO queueing, while a call made from
+   * INSIDE the held body is the self-deadlock this guards against.
+   */
+  private readonly outboundChain = new AsyncLocalStorage<true>();
+  /** Operations enqueued but not settled — keeps the happy path timer-free. */
+  private outboundPending = 0;
+  /** Bounded wait for the slot; a test seam, and the R1 escape from a wedged predecessor. */
+  private outboundSlotWaitMs = OUTBOUND_SLOT_WAIT_MS;
+  /** Append-only audit trail (S4): JSONL under the storage dir, capped + rotated. */
+  private readonly audit: AuditLog;
   /** Per-agent model overrides set by `/model switch` / `/reasoning` (applied via agent/request). */
   private readonly modelOverrides = new Map<string, ModelOverride>();
   /** Dedup for cross-session turn/end notifications (userId -> sessionIds already notified this turn). */
   private readonly notifiedCrossSessionTurns = new Map<string, Set<string>>();
-  /** Last assistant text per session (for cross-session completion preview). */
+  /**
+   * Last assistant text per session (for cross-session completion preview).
+   * Bounded FIFO at {@link ASSISTANT_PREVIEW_MAX_SESSIONS}: the value is a
+   * whole assistant message, so an unbounded map is a real leak on a long
+   * lived install with many sessions; eviction only means a completion card
+   * loses its quoted tail.
+   */
   private readonly lastAssistantTextBySession = new Map<string, string>();
   /**
    * Last user-prompt time per session (from `user/message` events with
    * source.kind === "user" — the same activity the GUI sidebar uses). Used
    * for `/s list` ordering and the time column; sessions without a recorded
    * activity (cold after restart) fall back to their creation time.
+   * Bounded FIFO at {@link ACTIVITY_MAX_SESSIONS} (numbers only — the cap
+   * exists because every session the process ever sees would otherwise stay
+   * resident forever).
    */
   private readonly lastActivityBySession = new Map<string, number>();
+  /**
+   * Inbound merge window state per WeChat chat (F1). Present only while a
+   * batch is open or a dispatch is in flight; deleted once drained, so this
+   * map never grows past the number of chats being merged (one peer here).
+   */
+  private readonly mergedText = new Map<string, MergeState>();
   /**
    * The most recent numbered session list per WeChat user. Keeping the exact
    * ids (rather than only its scope) lets a following shorthand `/s switch
@@ -472,6 +655,14 @@ export class WeChatDSHBridge {
     cwd: string;
     sessionIds: string[];
   }>();
+  /**
+   * `/at` references staged for the NEXT message, per WeChat user (one peer in
+   * practice). In-memory only: a reference is a one-shot intent, and after a
+   * restart the user's next sentence is very likely about something else, so
+   * resurrecting a stale mention would silently attach unrelated context to a
+   * new turn. `/at clear` and a TTL both drop it; delivery consumes it.
+   */
+  private readonly pendingRefs = new Map<string, PendingRefsState>();
   /**
    * Per-session message-source tracking for the dynamic WeChat surface
    * prompt: the most recent user-message origin per session ("wechat" when
@@ -486,7 +677,8 @@ export class WeChatDSHBridge {
   /**
    * Ids of user messages this bridge injected from WeChat (pending their
    * `user/message` echo), so `handleSessionEvent` can tell WeChat-injected
-   * messages apart from GUI-typed ones. One-shot consumption with a TTL.
+   * messages apart from GUI-typed ones. One-shot consumption with a TTL and a
+   * hard cap (see {@link markWechatMessage}).
    */
   private readonly wechatMessageIds = new Map<string, number>();
   /** True after plugin dispose; pending waterfall waiters must not settle to WeChat. */
@@ -533,7 +725,9 @@ export class WeChatDSHBridge {
     this.config = config;
     this.configStore = configStore;
     this.state = new StateStore(config.storageDir);
+    this.audit = new AuditLog(config.storageDir, (message) => this.log(message));
     this.migrateSilentFromUsers();
+    this.seedAllowlistFromPeer();
     this.restoreOutboundState();
     this.agents = new AgentStore(ctx);
     this.ops = new DshOps(ctx);
@@ -549,6 +743,72 @@ export class WeChatDSHBridge {
     if (this.configStore?.stored().silent !== undefined) return;
     if (!this.state.all().some((u) => u.silent)) return;
     this.persistEditable({ silent: true });
+  }
+
+  /**
+   * S3 — seed the inbound allowlist from the peer this install already
+   * belongs to.
+   *
+   * `allowedUsers` is empty by default, which means "the first inbound user
+   * becomes the peer". That is right for a fresh install and WRONG for an
+   * install that already has a bound peer: after the upgrade, the first
+   * stranger to message the bot would take it over. So when the list has
+   * never been configured (`config.json` carries no `allowedUsers` key) and
+   * `state.json` already names a peer, the peer is written into the list.
+   *
+   * Deliberately gated on "never configured": an explicitly stored `[]` is a
+   * decision (open to everyone) and is never overwritten. A brand-new install
+   * has no peer at all, so it keeps first-contact-wins and can never lock its
+   * owner out.
+   */
+  private seedAllowlistFromPeer(): void {
+    if (!this.configStore) return;
+    if (this.config.allowedUsers.length > 0) return;
+    if (this.configStore.stored().allowedUsers !== undefined) return;
+    const peer = this.boundPeerFromState();
+    if (!peer) return;
+    this.config.allowedUsers = [peer];
+    this.persistEditable({ allowedUsers: [peer] });
+    this.allowlistSeededPeer = peer;
+    this.log(
+      `seeded allowedUsers with the already bound peer ${maskUserId(peer)}`
+      + " (upgrade hardening: without it the next stranger to message the bot would become the peer)",
+    );
+  }
+
+  /** The peer an existing install already belongs to, or undefined on a fresh one. */
+  private boundPeerFromState(): string | undefined {
+    const users = this.state.all();
+    // Prefer a user with a real session binding; fall back to the first
+    // persisted user (the pre-existing `lockPeerFromState` rule: on a restart
+    // the first entry in `state.json` IS the peer) and then to a persisted
+    // outbound snapshot, which names the peer too.
+    const bound = users.find((u) => typeof u.sessionId === "string" && u.sessionId.length > 0);
+    return bound?.userId ?? users[0]?.userId ?? this.state.outbound()?.peerUserId ?? undefined;
+  }
+
+  /**
+   * Deliver the S3 seeding notice exactly once, to the peer it concerns.
+   *
+   * Called from the inbound path (and after login), so it needs no timer: the
+   * pending flag is cleared only when the message actually left the process,
+   * which keeps the "one-shot mark is a commit" rule — a logged-out bot does
+   * not burn the notice on a drop.
+   */
+  private notifyAllowlistSeed(userId: string): void {
+    const peer = this.allowlistSeededPeer;
+    if (!peer || peer !== userId) return;
+    if (!this.botReady() || this.tokenGiveUp) return;
+    this.allowlistSeededPeer = null;
+    void this.sendReply(
+      userId,
+      "🔐 升级提示：此前你的微信已是本 bot 的绑定用户，已自动把该账号写入入站白名单（allowedUsers），"
+      + "其它微信用户发消息将被忽略。\n"
+      + `你的微信 user id：${userId}\n`
+      + "查看：/status；修改或清空：DSH 设置 → WeChat → 入站白名单。",
+    ).catch((err) => {
+      this.log(`allowlist seed notice failed: ${String(err)}`);
+    });
   }
 
   /** Bind or create the WeChat user, inheriting the global silent default. */
@@ -592,11 +852,89 @@ export class WeChatDSHBridge {
     }
   }
 
-  /** Serialize remote sends with budget and durable queue mutations. */
+  /**
+   * Serialize remote sends with budget and durable queue mutations.
+   *
+   * Two safety properties, both added after the re-entrancy deadlock that
+   * shipped once (a locked body calling a public entry queued itself behind
+   * the operation it was awaiting, wedging the WHOLE outbound chain forever):
+   *
+   *  1. **Re-entrancy assertion.** Entering the slot from inside the async
+   *     chain that currently holds it is a programming error, not a queueing
+   *     decision. It is detected exactly (via `AsyncLocalStorage`, so a
+   *     legitimate concurrent caller that merely arrives while the slot is
+   *     held is NOT flagged) and fails LOUDLY and immediately instead of
+   *     deadlocking. The fix is always the same: call the `*Locked` variant.
+   *  2. **Bounded wait.** A single hung operation must not wedge every later
+   *     send: a waiter gives its predecessor {@link OUTBOUND_SLOT_WAIT_MS}
+   *     and then proceeds without it, with a loud log. This trades strict
+   *     FIFO order — only in the pathological case — for liveness.
+   *
+   * Happy path is deliberately cheap: when nothing is pending (`outboundPending
+   * === 0`) there is no timer, no race and no extra promise hop.
+   */
   private serializeOutbound<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.outboundSerial.then(operation, operation);
-    this.outboundSerial = run.then(() => undefined, () => undefined);
+    if (this.outboundChain.getStore() === true) {
+      const detail =
+        "serializeOutbound re-entered from inside the outbound critical section: "
+        + "a locked body must call the *Locked helper, never a public entry "
+        + "(this call would queue itself behind the operation it is awaiting and wedge every later send)";
+      console.error(`[dsh-wechat] ${detail}`);
+      this.audit.record({ event: "outbound-reentry", detail });
+      throw new Error(`dsh-wechat internal: ${detail}`);
+    }
+    const previous = this.outboundSerial;
+    const queued = this.outboundPending > 0;
+    const run = (async () => {
+      if (queued) {
+        await this.waitForOutboundSlot(previous);
+      } else {
+        // Free slot: still defer by one microtask, exactly like the
+        // `outboundSerial.then(...)` this replaced. Work enqueued in the same
+        // tick must be able to observe state changes that land before the
+        // first send starts — e.g. `logout()` bumping `outboundGeneration`
+        // right after a `void sendReply(...)`, which is what makes logout
+        // discard not-yet-sent payloads.
+        await Promise.resolve();
+      }
+      return this.outboundChain.run(true, () => operation());
+    })();
+    this.trackOutbound(run);
     return run;
+  }
+
+  /** Keep the FIFO tail and the pending counter honest for one enqueued operation. */
+  private trackOutbound<T>(run: Promise<T>): void {
+    this.outboundPending++;
+    const settled = run.then(
+      () => { this.outboundPending--; },
+      () => { this.outboundPending--; },
+    );
+    this.outboundSerial = settled;
+  }
+
+  /**
+   * Wait for the operation currently holding the slot, but never forever.
+   * `previous` never rejects (`trackOutbound` maps both outcomes), so the
+   * race cannot surface a spurious error into the next operation.
+   */
+  private async waitForOutboundSlot(previous: Promise<void>): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      previous.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), this.outboundSlotWaitMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) {
+      this.log(
+        `outbound slot still held after ${this.outboundSlotWaitMs}ms; proceeding WITHOUT it `
+        + "(a previous outbound operation appears wedged — liveness beats strict ordering here)",
+      );
+      this.audit.record({ event: "outbound-slot-timeout", waitMs: this.outboundSlotWaitMs });
+    }
   }
 
   /**
@@ -796,7 +1134,36 @@ export class WeChatDSHBridge {
 
   /** Remember one WeChat-injected message id for echo matching. */
   private markWechatMessage(messageId: string): void {
-    this.wechatMessageIds.set(messageId, Date.now());
+    const at = Date.now();
+    // One-shot mark + its release timer armed in the SAME block, so "every
+    // mark expires" is assertable by construction: the mark is consumed by
+    // the `user/message` echo, and an echo that never arrives still releases
+    // it here. The cap below is the hard ceiling above that soft TTL — the
+    // timer alone cannot bound a burst of messages the agent never claims.
+    const timer = setTimeout(() => {
+      if (this.wechatMessageIds.get(messageId) === at) this.wechatMessageIds.delete(messageId);
+    }, WECHAT_MSG_ID_TTL_MS);
+    timer.unref?.();
+    this.boundedSet(this.wechatMessageIds, messageId, at, WECHAT_MSG_IDS_MAX, "wechatMessageIds");
+  }
+
+  /**
+   * Insert into a memo map with a deterministic hard cap: re-inserting moves
+   * the key to the tail (so the eviction order is "least recently WRITTEN"),
+   * and overflowing drops the head — the oldest entry — with a loud log, the
+   * same rule `parkOutbound`'s hard ceiling follows. Every caller of this
+   * helper is a cache, never a queue: the evicted value is recomputable or
+   * merely cosmetic, which is why the cap may be small.
+   */
+  private boundedSet<K, V>(map: Map<K, V>, key: K, value: V, cap: number, label: string): void {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > cap) {
+      const oldest = map.keys().next();
+      if (oldest.done) break;
+      map.delete(oldest.value);
+      this.log(`${label}: cap ${cap} reached; evicted oldest entry (a cache, not a queue — nothing is lost)`);
+    }
   }
 
   /** Record that the last user message in `sessionId` came from WeChat. */
@@ -1001,6 +1368,12 @@ export class WeChatDSHBridge {
    */
   async stop(): Promise<void> {
     this.stopIlink("plugin-stop");
+    // Deliver what 打字合并 is holding BEFORE `stopInteraction()`: the merged
+    // batch is forwarded through `forwardToAgent`, which aborts as soon as the
+    // interaction is marked stopped — flushing afterwards would silently
+    // discard the user's own words. Same rule as the 结论模式 flush below: the
+    // peer is not changing, so already-produced input is delivered.
+    await this.flushAllMergedText("dispose");
     this.stopInteraction();
     this.processes.clear();
     this.assistantStreams.clear();
@@ -1023,6 +1396,8 @@ export class WeChatDSHBridge {
     // broken gateway cannot turn dispose into a rejection.
     await this.flushAllPendingFinal("dispose");
     await this.monitorTask;
+    // Release the audit descriptor last: everything above can still record.
+    this.audit.close();
   }
 
   /** Stop the WeChat long-poll and typing indicators; leave Host answerers running. */
@@ -1101,6 +1476,10 @@ export class WeChatDSHBridge {
     this.pendingApprovals.clear();
     this.pushedCardRpcIds.clear();
     this.notifiedCrossSessionTurns.clear();
+    // Identity change: a half-typed batch belongs to the peer we no longer
+    // serve and must never be handed to whoever binds next.
+    this.dropMergedText();
+    this.dropAllPendingRefs();
     this.discardPendingFinal();
     try {
       this.state.clearUsers();
@@ -1133,6 +1512,8 @@ export class WeChatDSHBridge {
     this.cacheNoticeSent = false;
     this.wechatMsgCount = 0;
     this.silentBuffers.clear();
+    this.dropMergedText();
+    this.dropAllPendingRefs();
     this.discardPendingFinal();
     this.persistOutboundState();
     if (parked > 0) {
@@ -1256,6 +1637,18 @@ export class WeChatDSHBridge {
       }
     }
 
+    // Turning 打字合并 off from the settings page must not swallow whatever
+    // the window was holding: those are the user's own words.
+    if (patch.mergeEnabled === false) {
+      await this.flushAllMergedText("config-merge-off");
+    }
+    // Same rule for the attachment hold: switching it off means "do not wait
+    // for me to type anything", so the held picture is delivered now rather
+    // than discarded.
+    if (patch.mediaMergeEnabled === false) {
+      await this.flushAllMergedText("config-media-merge-off");
+    }
+
     const editable: Record<string, unknown> = {};
     for (const key of EDITABLE_KEYS) {
       editable[key] = this.config[key];
@@ -1323,8 +1716,14 @@ export class WeChatDSHBridge {
     const allowed = this.config.allowedUsers;
     if (allowed.length > 0 && !allowed.some((id) => id === msg.from_user_id)) {
       // Logged, never answered: replying would confirm the bot is live to an
-      // unknown sender and spend a gateway message doing it.
-      this.log(`ignore inbound from ${msg.from_user_id}: not in allowedUsers`);
+      // unknown sender and spend a gateway message doing it. Both the log line
+      // and the audit record carry the MASKED id (S4).
+      this.log(`ignore inbound from ${maskUserId(msg.from_user_id)}: not in allowedUsers`);
+      this.audit.record({
+        event: "inbound-rejected",
+        user: maskUserId(msg.from_user_id),
+        reason: "allowedUsers",
+      });
       return;
     }
     if (this.peerUserId && this.peerUserId !== msg.from_user_id) return;
@@ -1373,6 +1772,9 @@ export class WeChatDSHBridge {
 
     const user = this.ensureBoundUser(userId);
     this.persistOutboundState(userId);
+    // S3 one-time notice: the allowlist was seeded on upgrade, and the peer
+    // should learn about it exactly once (see `notifyAllowlistSeed`).
+    this.notifyAllowlistSeed(userId);
 
     // Pull text once so both the card handler and the slash command
     // bypass check see the same input.
@@ -1440,9 +1842,23 @@ export class WeChatDSHBridge {
       await this.flushPending(userId);
     }
 
-    this.log(`Message from ${userId}: ${this.previewMessage(msg)}`);
+    this.log(`Message from ${maskUserId(userId)}: ${maskSecrets(this.previewMessage(msg))}`);
+    // S4 audit: masked sender + SIZE only — never the body. Recorded after the
+    // dedupe gate, so a replayed duplicate is not a second inbound event.
+    this.audit.record({
+      event: "inbound",
+      user: maskUserId(userId),
+      chars: text.length,
+      items: (msg.item_list ?? []).length,
+    });
 
     if (text) {
+      // One audit line per slash command (name only — never its arguments,
+      // which can carry a path, a preset name or an answer).
+      if (text.trim().startsWith("/")) {
+        const name = parseCommandName(text) ?? text.trim().split(/\s+/)[0]!.slice(0, 32);
+        this.audit.record({ event: "command", user: maskUserId(userId), command: name });
+      }
       if (isNext) {
         await this.flushPending(userId);
         return;
@@ -1459,8 +1875,26 @@ export class WeChatDSHBridge {
       // cannot leak through the slash parser.
       if (await this.tryNativeCommand(user, userId, text)) return;
 
-      if (parseHelpCommand(text)) {
-        // Augment /help with whatever the host's `ctx.commands` has
+      const help = parseHelpCommand(text);
+      if (help) {
+        if (typeof help === "object" && "topic" in help) {
+          // `/help <命令>` — that command's full example list. Wording and
+          // examples come from `src/help-catalog.ts`, the same source the
+          // settings panel renders.
+          await this.sendReply(userId, helpTopicBlock(help.topic) ?? formatHelp());
+          return;
+        }
+        if (typeof help === "object") {
+          // `/help <不存在的名字>` — still a help request, so answer it as
+          // help: say the name is not a command, then print the listing. This
+          // used to fall through to "未知命令 /help", which is the one reply
+          // guaranteed to be wrong (the user IS asking for help).
+          await this.sendReply(
+            userId,
+            `⚠️ 没有 /${help.unknown} 这条命令，下面是全部命令：\n\n${formatHelp(await this.listNativeCommandsForHelp(user))}`,
+          );
+          return;
+        }        // Augment /help with whatever the host's `ctx.commands` has
         // registered so users see the full command surface — not just
         // the local whitelist. Native descriptors that overlap with
         // local entries are de-duplicated inside `formatHelp`.
@@ -1477,6 +1911,18 @@ export class WeChatDSHBridge {
       const finalCmd = parseFinalCommand(text);
       if (finalCmd) {
         await this.handleFinalCommand(userId, finalCmd);
+        return;
+      }
+
+      const mergeCmd = parseMergeCommand(text);
+      if (mergeCmd) {
+        await this.handleMergeCommand(userId, mergeCmd);
+        return;
+      }
+
+      const mediaCmd = parseMediaCommand(text);
+      if (mediaCmd) {
+        await this.handleMediaCommand(userId, mediaCmd);
         return;
       }
 
@@ -1568,6 +2014,21 @@ export class WeChatDSHBridge {
         await this.handleHistoryCommand(userId, historyCmd, user);
         return;
       }
+      // `/at` is matched on the ATTEMPT: a mistyped subcommand gets usage
+      // instead of being forwarded to the agent as prose (which would look
+      // like the user asking the model to parse their command).
+      const atCmd = parseAtCommand(text);
+      if (atCmd) {
+        await this.handleAtCommand(userId, atCmd);
+        return;
+      }
+      if (isAtCommandAttempt(text)) {
+        await this.sendReply(
+          userId,
+          "⚠️ 用法: /at [s <编号|关键词> | f <路径> | rm <编号> | clear]\n发送 /at 查看已暂存的引用。",
+        );
+        return;
+      }
       // Invalid /history attempt (e.g. /history abc) — show usage instead of forwarding.
       if (isHistoryCommandAttempt(text)) {
         await this.sendReply(
@@ -1577,14 +2038,23 @@ export class WeChatDSHBridge {
         return;
       }
 
-      // Unrecognized slash command — hint, then forward to the agent.
-      const slashHint = detectUnknownSlashCommand(text);
-      if (slashHint) {
-        await this.sendReply(userId, `⚠️ 未知命令 ${slashHint}，已作为文本转发给 agent。发送 /help 查看可用命令。`);
+      // A documented command whose ARGUMENT did not parse gets its usage line,
+      // not "未知命令": `/model foo` names a command `/help` prints, so calling
+      // it unknown contradicts the listing. The text still goes to the agent —
+      // this is a hint, not a refusal.
+      const usageHint = commandUsageHint(text);
+      if (usageHint) {
+        await this.sendReply(userId, usageHint);
+      } else {
+        // Unrecognized slash command — hint, then forward to the agent.
+        const slashHint = detectUnknownSlashCommand(text);
+        if (slashHint) {
+          await this.sendReply(userId, `⚠️ 未知命令 ${slashHint}，已作为文本转发给 agent。发送 /help 查看可用命令。`);
+        }
       }
     }
 
-    await this.forwardToAgent(user, msg);
+    await this.enqueueInbound(user, msg);
   }
 
   private persistSessionBinding(user: UserState): void {
@@ -1611,9 +2081,89 @@ export class WeChatDSHBridge {
       );
     }
 
-    const tempDir = path.join(this.config.storageDir, "tempfile");
-    const blocks = await weixinMessageToPrompt(msg, this.config.cdnBaseUrl, (m) => this.log(m), tempDir);
+    const blocks = await this.promptBlocksFor(msg);
     if (this.interactionStopped) return;
+    await this.forwardBlocksToAgent(user, blocks, agent);
+  }
+
+  /**
+   * Convert ONE inbound WeChat message into prompt blocks (text + media).
+   *
+   * Split out of {@link forwardToAgent} so a merged batch can build its blocks
+   * from SEVERAL messages and then hand them to the same delivery path — the
+   * agent ensure, the `/at` mention, the source marker and the busy-enter
+   * choice must exist exactly once.
+   */
+  private promptBlocksFor(msg: WeixinMessage): Promise<Array<{ type: "text"; text: string }>> {
+    const tempDir = path.join(this.config.storageDir, "tempfile");
+    return weixinMessageToPrompt(msg, this.config.cdnBaseUrl, (m) => this.log(m), tempDir, {
+      // Spelling only: `@文件` renders as an openable chip in the GUI and the
+      // host's FILE_REFERENCE_PROMPT tells the model to `read` it; the plain-path
+      // wording is the same pointer as prose. Neither inlines the file.
+      refStyle: this.mediaAtRefEnabled() ? "at" : "path",
+    });
+  }
+
+  /**
+   * Deliver already-assembled blocks to the bound session's agent.
+   *
+   * `agent` may be passed when the caller already ensured it (the merge
+   * dispatcher does, to keep its ordering barrier honest about what it is
+   * waiting on).
+   */
+  private async forwardBlocksToAgent(
+    user: UserState,
+    blocks: Array<{ type: "text"; text: string }>,
+    ensured?: Agent,
+  ): Promise<void> {
+    const previousSessionId = user.sessionId;
+    let agent = ensured;
+    let replacedSessionId: string | undefined;
+    if (!agent) {
+      const result = await this.agents.ensure(user, { replaceOnResumeFailure: true });
+      agent = result.agent;
+      replacedSessionId = result.replacedSessionId;
+      if (this.interactionStopped) return;
+      this.persistSessionBinding(user);
+      if (!agent) {
+        const hint = previousSessionId
+          ? `（绑定会话 ${previousSessionId} 无法恢复）`
+          : "";
+        await this.sendReply(user.userId, `⚠️ 无法创建/恢复 DSH 会话${hint}，请检查 DSH 日志。`);
+        return;
+      }
+      if (replacedSessionId) {
+        await this.sendReply(
+          user.userId,
+          `⚠️ 原会话 ${replacedSessionId} 已损坏，无法恢复；已新建会话 ${user.sessionId}。`,
+        );
+      }
+    }
+    if (this.interactionStopped) return;
+    // `/at` references staged by the user ride THIS message, APPENDED after
+    // the user's own words.
+    //
+    // Order is deliberate. The host derives a session title from the first
+    // eligible user message (`dsh-session-title` joins every text block of
+    // that message), so a leading `@[标题](dsh-session:InNlc3N…)` would become
+    // the title of a brand-new session — and the deterministic fallback takes
+    // the message's LEADING words, which would be the base64 payload. Trailing
+    // placement keeps the user's own sentence first, which is also how the
+    // mention reads: "总结一下这个会话 @Alpha". Mention parsing is position-
+    // independent on the host side, so nothing depends on the block being
+    // first.
+    //
+    // Consumed only after `followup`/`steer` actually accepted the message:
+    // a failed agent ensure returns above, and losing the staged references
+    // there would make the user re-issue `/at` for a failure that was not
+    // their fault.
+    const staged = this.pendingRefsFor(user.userId);
+    // The block opens with a line break on purpose: the GUI flattens a
+    // message's text blocks by joining them with an EMPTY string, and the
+    // `@文件` grammar only fires at a whitespace boundary — see
+    // `MENTION_BLOCK_BREAK` in `at-refs.ts`.
+    const mentionBlock = staged ? buildMentionBlock(stagedRefList(staged)) : undefined;
+    if (mentionBlock) blocks.push({ type: "text", text: mentionBlock });
     this.markSessionSource(user.sessionId, "wechat");
     // Busy-time delivery follows the DSH `ui-conversation.busyEnter` setting
     // (the GUI's 「繁忙时 Enter 键行为」 row): while the agent is running,
@@ -1625,6 +2175,437 @@ export class WeChatDSHBridge {
     // AgentLoop, so neither mode can lose the message.
     const mode = agent.status === "running" ? this.ops.busyEnter() : "queue";
     this.agents.followup(agent, blocks, mode, (id) => this.markWechatMessage(id));
+    if (staged) this.dropPendingRefs(user.userId);
+  }
+
+  // ─── Inbound merge window (打字合并 + 图片/文件合并) ───
+  //
+  // One thought typed as five WeChat messages used to cost five turns. Bare
+  // text now enters a per-chat buffer that is delivered as ONE prompt when the
+  // silence window elapses or the message cap is reached. The rules that keep
+  // this from becoming a trap:
+  //
+  //   - an OUT-OF-ORDER older message never extends the silence timer (a late
+  //     replay must not hold a batch open while the user waits);
+  //   - the buffered count has a defensive hard cap (`mergeMaxMsgs`);
+  //   - a FORCED RELEASE (`mergeForcedReleaseMs`, default 3 min) dispatches the
+  //     batch no matter what — "rather two messages in one turn than a
+  //     permanently blocked channel";
+  //   - a message that arrives while a previous batch is in flight starts a
+  //     NEW batch that waits for the in-flight one only up to that same bound,
+  //     so it is never silently swallowed;
+  //   - a caption-less image / file / video is held ONLY while
+  //     `mediaMergeEnabled` is on, and then only until the sentence it belongs
+  //     to arrives or `mediaHoldMs` (bounded by the same forced release) runs
+  //     out. With the switch off (the default) media keeps the historical
+  //     rule: it first flushes the pending text as its own turn, then goes to
+  //     the agent as its own turn. Voice-without-a-transcript is never held —
+  //     holding it would delay a turn only to merge in a placeholder.
+  //
+  // Toggle from WeChat with `/merge on|off|status` and `/media on|off`;
+  // parameter defaults live in `config.ts`. `mergeSilenceMs: 0` (or
+  // `/merge off`) restores one-turn-per-message exactly.
+
+  private mergeEnabled(): boolean {
+    return this.config.mergeEnabled === true;
+  }
+
+  private mergeSilenceMs(): number {
+    const value = this.config.mergeSilenceMs;
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 3000;
+  }
+
+  private mergeMaxMsgs(): number {
+    const value = this.config.mergeMaxMsgs;
+    // `Math.max(1, …)`: a fractional value must still leave a usable cap —
+    // flooring 0.5 to 0 would flush on every single message.
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.max(1, Math.floor(value))
+      : 10;
+  }
+
+  private mergeForcedReleaseMs(): number {
+    const value = this.config.mergeForcedReleaseMs;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 3 * 60_000;
+  }
+
+  /** 图片/文件合并 total switch (default off = media is never delayed). */
+  private mediaMergeEnabled(): boolean {
+    return this.config.mediaMergeEnabled === true;
+  }
+
+  /**
+   * Attachment spelling: plain-path wording (default) or an `@文件` reference.
+   *
+   * Wording ONLY — `adapter/inbound.ts` is a pointer in both cases and never
+   * inlines the file's content, whatever this returns. Off by default because
+   * the chip only renders when the host has `dsh-file-reference` mounted.
+   */
+  private mediaAtRefEnabled(): boolean {
+    return this.config.mediaAtRefEnabled === true;
+  }
+
+  /**
+   * How long a held attachment waits for its sentence (default 3 min).
+   *
+   * Bounded by {@link mergeForcedReleaseMs} on purpose: the merge window's own
+   * liveness ceiling must also cap this wait, so a configured 10-minute media
+   * window can never outlive the batch's guaranteed dispatch. The two defaults
+   * are equal, so out of the box the attachment wait IS the longest a turn may
+   * be held.
+   */
+  private mediaHoldMs(): number {
+    const value = this.config.mediaHoldMs;
+    const own = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 3 * 60_000;
+    return Math.min(own, this.mergeForcedReleaseMs());
+  }
+
+  /** Buffered entries that are attachments (for `/status` and `/media`). */
+  private bufferedMediaCount(): number {
+    let total = 0;
+    for (const state of this.mergedText.values()) {
+      for (const entry of state.entries) if (entry.kind === "media") total += 1;
+    }
+    return total;
+  }
+
+  /**
+   * Entry point for every inbound item: decide merge vs. immediate turn.
+   *
+   * The decision is driven by WHAT the message carries, because the two
+   * features that buffer have different shapes:
+   *
+   *   - plain text → 打字合并 window (`mergeEnabled`);
+   *   - caption-less image/file/video → attachment hold (`mediaMergeEnabled`);
+   *   - text + its own media (one message) → never held: it already says what
+   *     it wants, so waiting for another sentence would only add latency;
+   *   - voice / anything else → never held.
+   */
+  private async enqueueInbound(user: UserState, msg: WeixinMessage): Promise<void> {
+    const text = extractText(msg.item_list);
+    const items = msg.item_list ?? [];
+    const hasItemMedia = items.some((item) => item.type !== undefined && item.type !== MessageItemType.TEXT);
+    const holdable = this.mediaMergeEnabled() ? findMediaItem(msg.item_list) : undefined;
+    const holdAsMedia = isHoldableMediaItem(holdable) && text === "";
+    const state = this.mergedText.get(user.userId);
+    const hasBuffered = state !== undefined && state.entries.length > 0;
+    const batchHasMedia = state?.entries.some((entry) => entry.kind === "media") === true;
+    const batchHasText = state?.entries.some((entry) => entry.kind === "text") === true;
+
+    // ── Held attachment ──
+    // A caption-less image/file/video joins the batch instead of ending it, so
+    // "screenshot … then the question" costs ONE turn with the question first.
+    if (holdAsMedia) {
+      const target = this.mergeStateFor(user.userId);
+      const now = Date.now();
+      const sourceAt = typeof msg.create_time_ms === "number" && Number.isFinite(msg.create_time_ms)
+        ? msg.create_time_ms
+        : now;
+      const newer = target.entries.length === 0 || sourceAt >= target.newestSourceAt;
+      target.entries.push({ kind: "media", msg, at: now });
+      if (newer) target.newestSourceAt = sourceAt;
+      if (batchHasText && target.silence) {
+        // The typed text this picture belongs to is already buffered: the
+        // flush now waits for a caption, so the per-message silence window has
+        // nothing left to decide. The attachment window is the live bound.
+        clearTimeout(target.silence);
+        target.silence = undefined;
+      }
+      this.armBatchCeilings(target);
+      if (target.entries.length >= this.mergeMaxMsgs()) {
+        await this.flushMergedText(user.userId, "cap");
+        return;
+      }
+      this.log(
+        `media-merge: holding attachment for ${maskUserId(user.userId)} `
+        + `(${target.entries.length} item(s), wait ${Math.round(this.mediaHoldMs() / 1000)}s)`,
+      );
+      return;
+    }
+
+    // ── Text that closes an attachment batch ──
+    // The sentence the user typed after the picture: append, then dispatch the
+    // whole batch immediately. Suffix tokens are deliberately NOT parsed here
+    // (`..` / `!!` belong to 打字合并, and stripping two characters off the
+    // sentence that finally explains the attachment risks mangling real text).
+    if (batchHasMedia && text !== "") {
+      const target = this.mergeStateFor(user.userId);
+      target.entries.push({ kind: "text", text, at: Date.now() });
+      target.newestSourceAt = Math.max(
+        target.newestSourceAt,
+        typeof msg.create_time_ms === "number" && Number.isFinite(msg.create_time_ms) ? msg.create_time_ms : Date.now(),
+      );
+      await this.flushMergedText(user.userId, "media-caption");
+      return;
+    }
+
+    if (!this.mergeEnabled() || this.mergeSilenceMs() <= 0 || !text || hasItemMedia) {
+      if (hasItemMedia && hasBuffered) {
+        // Deliver what was typed BEFORE the media item first: a batch that
+        // swallowed it and then handed over the image would reorder the
+        // conversation for the agent.
+        await this.flushMergedText(user.userId, "media");
+      }
+      await this.forwardToAgent(user, msg);
+      return;
+    }
+
+    // Suffix tokens. `!!` commits now, `..` keeps the batch open. Both are
+    // stripped from the text. A message that is ONLY the token acts as pure
+    // control when there is something to control (a bare `!!` commits the
+    // pending batch without polluting it) and stays literal text otherwise —
+    // a trailing token must never make the message disappear.
+    const batch = this.mergeStateFor(user.userId);
+    const buffered = batch.entries.length;
+    let body = text;
+    let commitNow = false;
+    let holdOpen = false;
+    if (this.config.mergeSuffixTokens === true) {
+      const trimmed = text.replace(/\s+$/, "");
+      const stripped = trimmed.slice(0, -2).trim();
+      const commitToken = trimmed.endsWith("!!") && (stripped.length > 0 || buffered > 0);
+      const holdToken = !commitToken && trimmed.endsWith("..") && (stripped.length > 0 || buffered > 0);
+      if (commitToken) {
+        commitNow = true;
+        body = stripped;
+      } else if (holdToken) {
+        holdOpen = true;
+        body = stripped;
+      }
+    }
+
+    const now = Date.now();
+    const sourceAt = typeof msg.create_time_ms === "number" && Number.isFinite(msg.create_time_ms)
+      ? msg.create_time_ms
+      : now;
+    const newer = batch.entries.length === 0 || sourceAt >= batch.newestSourceAt;
+    if (body.length > 0) {
+      batch.entries.push({ kind: "text", text: body, at: now });
+      if (newer) batch.newestSourceAt = sourceAt;
+    }
+    this.armBatchCeilings(batch);
+
+    if (batch.entries.length >= this.mergeMaxMsgs()) {
+      await this.flushMergedText(user.userId, "cap");
+      return;
+    }
+    if (commitNow) {
+      await this.flushMergedText(user.userId, "suffix-commit");
+      return;
+    }
+    if (holdOpen) {
+      // `..` = "I am not done": no silence flush; the cap, a later `!!`, a
+      // media message or the forced release still deliver the batch.
+      batch.holdOpen = true;
+      if (batch.silence) {
+        clearTimeout(batch.silence);
+        batch.silence = undefined;
+      }
+      this.log(`merge: batch for ${maskUserId(user.userId)} held open by '..' (${batch.entries.length} msg)`);
+      return;
+    }
+    if (batch.holdOpen) {
+      // Still inside an explicit `..` hold: appending is all this message does.
+      return;
+    }
+    // Only a message that is not older than everything buffered re-arms the
+    // silence window (the out-of-order guard).
+    if (newer) {
+      if (batch.silence) clearTimeout(batch.silence);
+      batch.silence = this.armMergeTimer(batch, this.mergeSilenceMs(), "silence");
+    } else {
+      this.log(`merge: ignoring out-of-order older message for ${maskUserId(user.userId)} (silence timer not extended)`);
+    }
+  }
+
+  /**
+   * Arm the timers every open batch needs regardless of which feature opened
+   * it: the forced release (always) and the attachment wait (only while a
+   * media entry is buffered).
+   */
+  private armBatchCeilings(state: MergeState): void {
+    if (!state.ceiling) state.ceiling = this.armMergeTimer(state, this.mergeForcedReleaseMs(), "forced-release");
+    const hasMedia = state.entries.some((entry) => entry.kind === "media");
+    if (hasMedia && !state.mediaTimer) {
+      state.mediaTimer = this.armMergeTimer(state, this.mediaHoldMs(), "media-wait");
+    }
+  }
+
+  private mergeStateFor(userId: string): MergeState {
+    let state = this.mergedText.get(userId);
+    if (!state) {
+      state = {
+        userId,
+        entries: [],
+        newestSourceAt: 0,
+        firstAt: Date.now(),
+        holdOpen: false,
+        inFlight: null,
+      };
+      this.mergedText.set(userId, state);
+    }
+    return state;
+  }
+
+  /** Arm one batch timer; every timer is cleared on every flush path. */
+  private armMergeTimer(state: MergeState, ms: number, reason: string): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      void this.flushMergedText(state.userId, reason).catch((err) => {
+        this.log(`merge flush (${reason}) failed for ${maskUserId(state.userId)}: ${String(err)}`);
+      });
+    }, ms);
+    timer.unref?.();
+    return timer;
+  }
+
+  /**
+   * Deliver the chat's buffered items as ONE prompt.
+   *
+   * Assembly order is TEXT FIRST, then attachments: the host's title generator
+   * joins every text block of the first eligible user message, and a media
+   * block leading would title the session
+   * `[收到图片] 文件已保存到: C:/…` — the same reason `/at` mentions are
+   * appended rather than prepended.
+   *
+   * Attachments are downloaded HERE, not when they were buffered: a batch that
+   * is dropped (identity change) must not have spent network or disk on files
+   * nobody will receive, and the user's own media is fetched once, at the
+   * moment its sentence is known.
+   *
+   * Ordering: a batch that arrives while the previous one is still being
+   * dispatched waits for it — but only up to `mergeForcedReleaseMs`, after
+   * which it logs and dispatches anyway. Waiting is about preserving the
+   * user's message order; it is never allowed to become a stuck channel.
+   */
+  private async flushMergedText(userId: string, reason: string): Promise<void> {
+    const state = this.mergedText.get(userId);
+    if (!state || state.entries.length === 0) return;
+    const entries = state.entries.splice(0, state.entries.length);
+    state.holdOpen = false;
+    if (state.silence) {
+      clearTimeout(state.silence);
+      state.silence = undefined;
+    }
+    if (state.ceiling) {
+      clearTimeout(state.ceiling);
+      state.ceiling = undefined;
+    }
+    if (state.mediaTimer) {
+      clearTimeout(state.mediaTimer);
+      state.mediaTimer = undefined;
+    }
+    state.newestSourceAt = 0;
+    const user = this.state.getUser(userId);
+    if (!user) {
+      this.log(`merge: dropping ${entries.length} buffered item(s) for unknown user ${maskUserId(userId)}`);
+      this.dropMergedText(userId);
+      return;
+    }
+    const texts = entries.filter((entry) => entry.kind === "text").map((entry) => entry.text);
+    const mediaMsgs = entries.filter((entry) => entry.kind === "media").map((entry) => entry.msg);
+    this.log(
+      `merge flush (${reason}): ${texts.length} text / ${mediaMsgs.length} attachment(s) for ${maskUserId(userId)}`,
+    );
+    const previous = state.inFlight;
+    const run = (async () => {
+      if (previous) {
+        let timer: NodeJS.Timeout | undefined;
+        const timedOut = await Promise.race([
+          previous.then(() => false),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(true), this.mergeForcedReleaseMs());
+            timer.unref?.();
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+        if (timedOut) {
+          this.log(
+            `merge: previous batch for ${maskUserId(userId)} still in flight after `
+            + `${this.mergeForcedReleaseMs()}ms; dispatching anyway (a blocked channel is worse than two turns)`,
+          );
+        }
+      }
+      // One media message → its own blocks; the whole batch → one prompt.
+      const blocks: Array<{ type: "text"; text: string }> = [];
+      const text = texts.join("\n");
+      if (text.length > 0) blocks.push({ type: "text", text });
+      for (const msg of mediaMsgs) {
+        blocks.push(...(await this.promptBlocksFor(msg)));
+      }
+      if (blocks.length === 0) blocks.push({ type: "text", text: "[空消息]" });
+      await this.forwardBlocksToAgent(user, blocks);
+    })();
+    const tracked = run.then(
+      () => undefined,
+      (err) => {
+        this.log(`merge dispatch failed for ${maskUserId(userId)}: ${String(err)}`);
+      },
+    );
+    state.inFlight = tracked;
+    await tracked;
+    if (state.inFlight === tracked) state.inFlight = null;
+    if (state.entries.length === 0 && state.inFlight === null) this.mergedText.delete(userId);
+  }
+
+  /** Deliver every open batch (plugin dispose — the user's own words are not destroyed). */
+  private async flushAllMergedText(reason: string): Promise<void> {
+    for (const userId of [...this.mergedText.keys()]) {
+      try {
+        await this.flushMergedText(userId, reason);
+      } catch (err) {
+        this.log(`merge flush-all failed for ${maskUserId(userId)}: ${String(err)}`);
+      }
+    }
+  }
+
+  /** Drop a chat's buffer and timers (identity change: logout / re-login / re-bind). */
+  private dropMergedText(userId?: string): void {
+    const targets = userId === undefined ? [...this.mergedText.keys()] : [userId];
+    for (const key of targets) {
+      const state = this.mergedText.get(key);
+      if (!state) continue;
+      if (state.silence) clearTimeout(state.silence);
+      if (state.ceiling) clearTimeout(state.ceiling);
+      if (state.mediaTimer) clearTimeout(state.mediaTimer);
+      // Held attachments are dropped BEFORE any download happened, so this
+      // discards the intent and nothing else: no temp file, no network call.
+      this.mergedText.delete(key);
+    }
+  }
+
+  /** Human-readable merge state for `/merge status` and `/status` (never write-only state). */
+  private mergeStatusText(): string {
+    const heldMedia = this.bufferedMediaCount();
+    const mediaSuffix = heldMedia > 0 ? ` · 含 ${heldMedia} 个附件` : "";
+    if (!this.mergeEnabled()) {
+      return heldMedia > 0
+        ? `off（每条消息各自一轮）${mediaSuffix}`
+        : "off（每条消息各自一轮）";
+    }
+    const pending = this.pendingMergedCount();
+    const window = this.mergeSilenceMs();
+    if (window <= 0) return `on（窗口 0ms = 立即转发）${mediaSuffix}`;
+    // How long the oldest open batch has been waiting: the window is otherwise
+    // invisible until it fires, which makes "why is nothing happening?" hard
+    // to answer from WeChat alone.
+    const open = [...this.mergedText.values()].find((state) => state.entries.length > 0);
+    const openFor = open ? Math.round((Date.now() - open.firstAt) / 1000) : undefined;
+    return `on（静默 ${(window / 1000).toFixed(1)}s / 上限 ${this.mergeMaxMsgs()} 条 / 强制放行 ${Math.round(this.mergeForcedReleaseMs() / 1000)}s${pending > 0 ? ` / 暂存 ${pending} 条（已等 ${openFor}s）${mediaSuffix}` : ""}）`;
+  }
+
+  /** 图片/文件合并 state, for `/media` and `/status` (never write-only state). */
+  private mediaMergeStatusText(): string {
+    const ref = this.mediaAtRefEnabled() ? "@引用" : "路径";
+    if (!this.mediaMergeEnabled()) return `off · 交付: ${ref}`;
+    const held = this.bufferedMediaCount();
+    return `on（等待 ${Math.round(this.mediaHoldMs() / 1000)}s${held > 0 ? ` / 暂存 ${held} 个附件` : ""}）· 交付: ${ref}`;
+  }
+
+  /** Buffered (not yet dispatched) inbound message count across chats. */
+  private pendingMergedCount(): number {
+    let total = 0;
+    for (const state of this.mergedText.values()) total += state.entries.length;
+    return total;
   }
 
   // ─── Outbound: DSH → WeChat ───
@@ -1690,9 +2671,12 @@ export class WeChatDSHBridge {
     if (event.type === "user/message") {
       const data = event.data as { source?: { kind?: string }; id?: string };
       if (data?.source?.kind === "user") {
-        this.lastActivityBySession.set(
+        this.boundedSet(
+          this.lastActivityBySession,
           sessionId,
           typeof event.time === "number" ? event.time : Date.now(),
+          ACTIVITY_MAX_SESSIONS,
+          "lastActivityBySession",
         );
         // Fallback source marking (the authoritative one happens on
         // agent/inbox/spliced above; this echo is emitted AFTER assembly,
@@ -1730,7 +2714,15 @@ export class WeChatDSHBridge {
         .filter((b) => b.type === "text" && b.text)
         .map((b) => b.text)
         .join("\n");
-      if (text) this.lastAssistantTextBySession.set(sessionId, text);
+      if (text) {
+        this.boundedSet(
+          this.lastAssistantTextBySession,
+          sessionId,
+          text,
+          ASSISTANT_PREVIEW_MAX_SESSIONS,
+          "lastAssistantTextBySession",
+        );
+      }
     }
 
     const user = this.userForAgent(sessionId);
@@ -2269,8 +3261,7 @@ export class WeChatDSHBridge {
     this.pendingApprovals.set(userId, list);
     const userState = this.state.getUser(userId);
     if (userState?.sessionId === sessionId || this.shouldNotifyCrossSession(userId)) {
-      this.markCardPushed(userId, rpcId);
-      void this.sendApprovalCard(userId, card).catch(() => {});
+      this.pushCardOnce(userId, rpcId, () => this.sendApprovalCard(userId, card));
     }
 
     const gui = Promise.resolve()
@@ -2349,8 +3340,7 @@ export class WeChatDSHBridge {
     this.pendingQuestions.set(userId, list);
     const userState = this.state.getUser(userId);
     if (userState?.sessionId === sessionId || this.shouldNotifyCrossSession(userId)) {
-      this.markCardPushed(userId, rpcId);
-      void this.sendQuestionCard(userId, card, questions).catch(() => {});
+      this.pushCardOnce(userId, rpcId, () => this.sendQuestionCard(userId, card, questions));
     }
 
     type QuestionWinner =
@@ -2431,8 +3421,7 @@ export class WeChatDSHBridge {
         this.pendingApprovals.set(userId, list);
         const userState = this.state.getUser(userId);
         if (userState?.sessionId === sessionId || this.shouldNotifyCrossSession(userId)) {
-          this.markCardPushed(userId, frame.rpcId);
-          void this.sendApprovalCard(userId, card).catch(() => {});
+          this.pushCardOnce(userId, frame.rpcId, () => this.sendApprovalCard(userId, card));
         }
         break;
       }
@@ -2479,8 +3468,7 @@ export class WeChatDSHBridge {
         this.pendingQuestions.set(userId, list);
         const userState = this.state.getUser(userId);
         if (userState?.sessionId === sessionId || this.shouldNotifyCrossSession(userId)) {
-          this.markCardPushed(userId, frame.rpcId);
-          void this.sendQuestionCard(userId, card, questions).catch(() => {});
+          this.pushCardOnce(userId, frame.rpcId, () => this.sendQuestionCard(userId, card, questions));
         }
         break;
       }
@@ -2696,12 +3684,10 @@ export class WeChatDSHBridge {
     const unseenQuestions = questions.filter((c) => !this.isCardPushed(userId, c.rpcId));
     if (unseenApprovals.length > 0 || unseenQuestions.length > 0) {
       for (const card of unseenApprovals) {
-        this.markCardPushed(userId, card.rpcId);
-        void this.sendApprovalCard(userId, card).catch(() => {});
+        this.pushCardOnce(userId, card.rpcId, () => this.sendApprovalCard(userId, card));
       }
       for (const card of unseenQuestions) {
-        this.markCardPushed(userId, card.rpcId);
-        void this.sendQuestionCard(userId, card, card.items).catch(() => {});
+        this.pushCardOnce(userId, card.rpcId, () => this.sendQuestionCard(userId, card, card.items));
       }
     }
 
@@ -2714,12 +3700,10 @@ export class WeChatDSHBridge {
     const questions = (this.pendingQuestions.get(userId) ?? []).filter((c) => !this.isCardPushed(userId, c.rpcId));
     if (approvals.length === 0 && questions.length === 0) return;
     for (const card of approvals) {
-      this.markCardPushed(userId, card.rpcId);
-      void this.sendApprovalCard(userId, card).catch(() => {});
+      this.pushCardOnce(userId, card.rpcId, () => this.sendApprovalCard(userId, card));
     }
     for (const card of questions) {
-      this.markCardPushed(userId, card.rpcId);
-      void this.sendQuestionCard(userId, card, card.items).catch(() => {});
+      this.pushCardOnce(userId, card.rpcId, () => this.sendQuestionCard(userId, card, card.items));
     }
   }
 
@@ -2820,6 +3804,36 @@ export class WeChatDSHBridge {
     const set = this.pushedCardRpcIds.get(userId) ?? new Set<string>();
     set.add(rpcId);
     this.pushedCardRpcIds.set(userId, set);
+  }
+
+  /**
+   * Push one card and claim its one-shot "already pushed" mark — in that
+   * order, and only when the card can actually leave the process.
+   *
+   * Why the order matters (S5): `sendReply` DROPS its payload while the bot is
+   * logged out or mid re-login (it does not park it), so marking first burns
+   * the one-shot on a delivery that never happened, and `isCardPushed` then
+   * blocks the re-push until the card times out — the user simply never sees
+   * the card. Reachability is therefore confirmed BEFORE the mark is taken,
+   * and the mark is rolled back if the send itself throws (the same
+   * mark-then-rollback shape `notifyCachePendingLocked` uses). A "parked"
+   * outcome is a success for this purpose: the card text is in the durable
+   * FIFO and will be flushed.
+   */
+  private pushCardOnce(userId: string, rpcId: string, send: () => Promise<void>): void {
+    if (this.interactionStopped) return;
+    if (!this.botReady() || this.tokenGiveUp) {
+      this.log(
+        `card ${rpcId} not marked as pushed: bot unreachable `
+        + "(no token / -14 give-up), so a later attempt can still deliver it",
+      );
+      return;
+    }
+    this.markCardPushed(userId, rpcId);
+    void send().catch((err) => {
+      this.unmarkCardPushed(userId, rpcId);
+      this.log(`card ${rpcId} push failed; pushed-mark rolled back so it can be re-sent: ${String(err)}`);
+    });
   }
 
   /** Whether the card's full content was already pushed to WeChat for this user. */
@@ -2946,6 +3960,16 @@ export class WeChatDSHBridge {
   ): Promise<{ accepted: boolean; reason?: string }> {
     if (entry.settled) return { accepted: false, reason: "not-pending" };
     entry.settled = true;
+    // S4 audit: one line per decision actually applied (a duplicate attempt
+    // returns early above and is not a decision).
+    this.audit.record({
+      event: "decision",
+      kind: "approval",
+      user: maskUserId(entry.userId),
+      session: maskUserId(entry.sessionId),
+      tool: entry.toolName,
+      decision: outcome,
+    });
     if (entry.settleWechat) {
       entry.settleWechat(outcome);
       return { accepted: true };
@@ -3047,6 +4071,17 @@ export class WeChatDSHBridge {
   ): Promise<{ accepted: boolean; reason?: string }> {
     if (entry.settled) return { accepted: false, reason: "not-pending" };
     entry.settled = true;
+    // S4 audit: the decision and its size, never the answer text (an answer
+    // can quote anything the agent asked about).
+    this.audit.record({
+      event: "decision",
+      kind: "question",
+      user: maskUserId(entry.userId),
+      session: maskUserId(entry.sessionId),
+      items: entry.items.length,
+      decision: "answered",
+      chars: JSON.stringify(answer ?? "").length,
+    });
     if (entry.settleWechat) {
       entry.settleWechat(answer);
       return { accepted: true };
@@ -3291,6 +4326,103 @@ export class WeChatDSHBridge {
     );
   }
 
+  // ─── 打字合并 / inbound merge window (/merge) ───
+
+  /**
+   * `/merge` — view or switch the inbound merge window. Mirrors `/silent`:
+   * persisted to `config.json` (survives a re-scan), shown in the settings
+   * page, bypasses a pending card, appears in `/help` and in
+   * `LOCAL_COMMAND_NAMES` so a native command of the same name never shadows
+   * it.
+   *
+   * Turning it OFF flushes the buffer first: those are the user's own words
+   * and dropping them because they flipped a switch would silently swallow a
+   * message (the same rule `/final off` follows).
+   */
+  private async handleMergeCommand(userId: string, cmd: MergeCommand): Promise<void> {
+    if (cmd.mode === "on") {
+      this.persistEditable({ mergeEnabled: true });
+      await this.sendReply(
+        userId,
+        "🧵 打字合并已开启：连续几条消息会在你停手后合并成一轮。\n"
+        + `静默 ${(this.mergeSilenceMs() / 1000).toFixed(1)}s / 最多 ${this.mergeMaxMsgs()} 条 / 最长 ${Math.round(this.mergeForcedReleaseMs() / 1000)}s 必发；`
+        + "消息末尾 `..` 表示还要接着说，`!!` 表示立刻提交（这两个后缀会被去掉）。图片/文件不参与合并，会先把已输入的文字发出去。",
+      );
+      return;
+    }
+    if (cmd.mode === "off") {
+      const pending = this.pendingMergedCount();
+      this.persistEditable({ mergeEnabled: false });
+      if (pending > 0) await this.flushMergedText(userId, "command-off");
+      await this.sendReply(
+        userId,
+        pending > 0
+          ? `🧵 打字合并已关闭；已把暂存的 ${pending} 条消息作为一轮发出。之后每条消息各自一轮。`
+          : "🧵 打字合并已关闭：之后每条消息各自一轮。",
+      );
+      return;
+    }
+    await this.sendReply(
+      userId,
+      `🧵 打字合并: ${this.mergeStatusText()}`
+      + "\n切换: /merge on|off（设置页「打字合并」同步，写入 config.json 后重新扫码仍保留）",
+    );
+  }
+
+  // ─── 图片/文件合并 + 附件交付方式 (/media) ───
+
+  /**
+   * `/media` — hold a caption-less image/file/video until the sentence that
+   * explains it, and choose how an attachment is handed to the model.
+   *
+   * Wired exactly like `/merge`: persisted to `config.json`, mirrored in the
+   * settings page, bypasses a pending card, listed in `/help` and
+   * `LOCAL_COMMAND_NAMES`. Turning the hold OFF flushes what it was holding
+   * first — "stop waiting for me" is not "throw the picture away".
+   */
+  private async handleMediaCommand(userId: string, cmd: MediaCommand): Promise<void> {
+    if (cmd.target === "merge") {
+      if (cmd.mode === "on") {
+        this.persistEditable({ mediaMergeEnabled: true });
+        await this.sendReply(
+          userId,
+          "🖼 图片/文件合并已开启：先发图片/文件（不带文字），再发那句要它做的事，"
+          + "两者会合成**一轮**发给我。\n"
+          + `等待上限 ${Math.round(this.mediaHoldMs() / 1000)}s（超过就先单独处理，不会一直挂着）；`
+          + "消息自带文字说明时立即发送；语音不参与。",
+        );
+        return;
+      }
+      const held = this.bufferedMediaCount();
+      this.persistEditable({ mediaMergeEnabled: false });
+      if (held > 0) await this.flushMergedText(userId, "command-media-off");
+      await this.sendReply(
+        userId,
+        held > 0
+          ? `🖼 图片/文件合并已关闭；已把暂存的 ${held} 个附件作为一轮发出。之后附件各自一轮。`
+          : "🖼 图片/文件合并已关闭：之后图片/文件各自一轮，不再等待文字。",
+      );
+      return;
+    }
+    if (cmd.target === "ref") {
+      this.persistEditable({ mediaAtRefEnabled: cmd.style === "at" });
+      await this.sendReply(
+        userId,
+        cmd.style === "at"
+          ? "📎 附件交付: @引用（消息里是一个可点开的 @路径，模型自己按需 read）"
+          : "📎 附件交付: 路径（消息里是「文件已保存到: 路径」，模型自己按需 read）",
+      );
+      return;
+    }
+    await this.sendReply(
+      userId,
+      `🖼 图片/文件合并: ${this.mediaMergeStatusText()}`
+      + "\n切换: /media on|off（是否等待随后那条文字）、/media at|path（@引用 还是纯路径措辞）"
+      + "\n两种交付都只是指针：文件内容不会进消息，模型需要时自己 read。"
+      + "\n设置页「图片与文件」同步，写入 config.json 后重新扫码仍保留。",
+    );
+  }
+
   // ─── Busy-Enter delivery behavior (/enter) ───
 
   /**
@@ -3481,7 +4613,9 @@ export class WeChatDSHBridge {
       scoped.map(async (record) => {
         if (this.lastActivityBySession.has(record.header.id)) return;
         const time = await this.ops.lastUserMessageTime(record.header.id, record.header.cwd, record.header);
-        if (time !== undefined) this.lastActivityBySession.set(record.header.id, time);
+        if (time !== undefined) {
+          this.boundedSet(this.lastActivityBySession, record.header.id, time, ACTIVITY_MAX_SESSIONS, "lastActivityBySession");
+        }
       }),
     );
 
@@ -3605,7 +4739,7 @@ export class WeChatDSHBridge {
           const pin = pinnedIds.has(record.header.id) ? "📌 " : "";
           const title = cleanSessionTitle(row?.title ?? record.header.id.slice(0, 12));
           if (row?.lastUserMessageTime !== undefined) {
-            this.lastActivityBySession.set(record.header.id, row.lastUserMessageTime);
+            this.boundedSet(this.lastActivityBySession, record.header.id, row.lastUserMessageTime, ACTIVITY_MAX_SESSIONS, "lastActivityBySession");
           }
           const when = this.formatRelativeTime(this.sessionActivityTime(record));
           const presetId = row?.preset;
@@ -4000,11 +5134,11 @@ export class WeChatDSHBridge {
 
   /**
    * `/reasoning` — view or switch the reasoning effort. The effort rides the
-   * same model selection as the GUI's model picker: the current session's
-   * override or logged config, with the deployment default underneath.
-   * Switching persists via `agentDefaultModel.saveSelection` (same settings
-   * document the GUI edits) and applies to the live agent through the
-   * `agent/request` override.
+   * same model selection as the GUI's model picker. Switching goes through
+   * `sessionController.selectModel` (the exact Remote the GUI submits) so the
+   * durable `model/selection` and the GUI projection update together; on
+   * hosts without that service it falls back to `agentDefaultModel` +
+   * the legacy request override.
    */
   private async handleReasoningCommand(userId: string, cmd: ReasoningCommand): Promise<void> {
     const user = this.ensureBoundUser(userId);
@@ -4087,35 +5221,655 @@ export class WeChatDSHBridge {
           );
           return;
         }
-        // Apply to the live agent (via agent/request) and as the new default.
-        const selection = { provider: active!.provider!, model: active!.model!, reasoningEffort: matched.id };
+        // Route through the Host session controller first: `selectModel` is
+        // the exact Remote the GUI model picker submits, so it records the
+        // durable `model/selection`, installs the selection for the next
+        // step, and updates the default — GUI and WeChat stay on one plan.
+        // Only deployments without that service fall back to the legacy
+        // in-memory request override.
+        const selection = {
+          provider: active!.provider!,
+          model: active!.model!,
+          reasoningEffort: matched.id,
+        };
+        let appliedToGui = false;
+        let saved: boolean;
         if (agent) {
-          this.modelOverrides.set(agent.id, selection);
+          const applied = await this.ops.selectSessionModel(agent.id, selection);
+          if (applied.kind === "error") {
+            await this.sendReply(userId, `⚠️ 无法切换推理等级: ${applied.message}`);
+            return;
+          }
+          if (applied.kind === "host") {
+            // The Host's selectModel already queues the default save.
+            this.modelOverrides.delete(agent.id);
+            appliedToGui = true;
+            saved = true;
+          } else {
+            this.setModelOverride(agent.id, selection);
+            saved = await this.ops.saveDefaultModel(selection);
+          }
+        } else {
+          saved = await this.ops.saveDefaultModel(selection);
         }
-        const saved = await this.ops.saveDefaultModel(selection);
         const lines = [`✅ 推理等级已切换: ${matched.name}（${matched.id}）`];
-        if (agent) lines.push("（已应用到当前会话，下一步生效）");
+        if (agent && appliedToGui) lines.push("（已同步到 GUI 的模型选择器）");
+        else if (agent) lines.push("（已应用到当前会话，下一步生效）");
         if (!saved) lines.push("⚠️ 无法更新默认（仅当前会话生效）");
         await this.sendReply(userId, lines.join("\n"));
         return;
       }
       case "clear": {
         // Restore the provider/model default: drop the effort from the
-        // override and from the persisted default.
+        // Host-owned selection (and from any legacy override), then clear
+        // the persisted default's effort.
+        const selection = { provider: active!.provider!, model: active!.model! };
+        let appliedToGui = false;
+        let saved: boolean;
         if (agent) {
-          const override = this.modelOverrides.get(agent.id);
-          if (override) {
-            const { reasoningEffort: _dropped, ...rest } = override;
-            this.modelOverrides.set(agent.id, rest);
+          const applied = await this.ops.selectSessionModel(agent.id, selection);
+          if (applied.kind === "error") {
+            await this.sendReply(userId, `⚠️ 无法恢复推理等级: ${applied.message}`);
+            return;
           }
+          if (applied.kind === "host") {
+            this.modelOverrides.delete(agent.id);
+            appliedToGui = true;
+            saved = true;
+          } else {
+            const override = this.modelOverrides.get(agent.id);
+            if (override) this.setModelOverride(agent.id, selection);
+            saved = await this.ops.saveDefaultModel(selection);
+          }
+        } else {
+          saved = await this.ops.saveDefaultModel(selection);
         }
-        const saved = await this.ops.saveDefaultModel({ provider: active!.provider!, model: active!.model! });
         const lines = ["✅ 推理等级已恢复为模型默认"];
+        if (agent && appliedToGui) lines.push("（已同步到 GUI 的模型选择器）");
         if (!saved) lines.push("⚠️ 无法更新默认（仅当前会话生效）");
         await this.sendReply(userId, lines.join("\n"));
         return;
       }
     }
+  }
+
+  // ─── References (`/at`) ───────────────────────────────────────────────────
+
+  /**
+   * `/at` — stage a session or file reference for the NEXT message.
+   *
+   * WeChat has no composer, so the GUI's `@` completion is replaced by an
+   * explicit staging step: `/at` records the reference, replies with what is
+   * staged, and `forwardToAgent` prepends the mentions to the next delivered
+   * message. Every rejection below happens BEFORE anything is sent, because
+   * the host's `agent/pre-step` treats a bad mention as fatal for the turn:
+   *
+   *   - a self-reference throws `SESSION_REFERENCE_SELF_REFERENCE`;
+   *   - a fourth session throws `SESSION_REFERENCE_TOO_MANY`;
+   *   - an unreadable target throws `SESSION_REFERENCE_READ_FAILED`.
+   *
+   * Failing at `/at` time costs one reply; failing at send time costs the
+   * user's whole prompt.
+   */
+  private async handleAtCommand(userId: string, cmd: AtCommand): Promise<void> {
+    const user = this.ensureBoundUser(userId);
+    switch (cmd.kind) {
+      case "list":
+        await this.sendReply(userId, this.formatStagedRefs(userId));
+        return;
+      case "clear": {
+        const removed = this.clearPendingRefs(userId);
+        await this.sendReply(
+          userId,
+          removed > 0 ? `🧹 已清空 ${removed} 条引用暂存。` : "📭 当前没有暂存的引用。",
+        );
+        return;
+      }
+      case "remove": {
+        const outcome = this.removePendingRef(userId, cmd.index);
+        await this.sendReply(userId, outcome);
+        return;
+      }
+      case "session":
+        await this.stageSessionRef(userId, user, cmd.target);
+        return;
+      case "file":
+        await this.stageFileRef(userId, user, cmd.target);
+        return;
+    }
+  }
+
+  /** `/at s …` — resolve, validate, and stage one session reference. */
+  private async stageSessionRef(userId: string, user: UserState, target: string): Promise<void> {
+    if (!target) {
+      await this.sendReply(userId, "⚠️ 用法: /at s <编号|关键词>（编号来自 /s list）");
+      return;
+    }
+    // The mention is only meaningful if the host service that expands it is
+    // composed; without it the token would be forwarded as literal text and
+    // the model would see a base64 blob instead of a conversation snapshot.
+    if (!this.ops.sessionReferenceResolver()) {
+      await this.sendReply(
+        userId,
+        "⚠️ 当前 DSH 未挂载会话引用服务（dsh-session-reference），无法引用会话。可以改用 /at f 引用文件。",
+      );
+      return;
+    }
+
+    const state = this.pendingRefsFor(userId);
+    if (state && state.sessions.length >= AT_SESSION_LIMIT) {
+      await this.sendReply(
+        userId,
+        `⚠️ 已暂存 ${AT_SESSION_LIMIT} 个会话引用（宿主单条消息最多 ${AT_SESSION_LIMIT} 个）。`
+        + "先发消息带上它们，或 /at rm <编号> 移除一个。",
+      );
+      return;
+    }
+
+    const resolved = await this.resolveAtSessionTarget(user, target);
+    if (resolved.kind === "error") {
+      await this.sendReply(userId, resolved.message);
+      return;
+    }
+    const sessionId = resolved.sessionId;
+    if (user.sessionId && sessionId === user.sessionId) {
+      await this.sendReply(
+        userId,
+        "⚠️ 不能引用当前会话自己（宿主会以「不能引用自身」终止整轮）。切换会话后引用其它会话。",
+      );
+      return;
+    }
+    if (state?.sessions.some((s) => s.sessionId === sessionId)) {
+      await this.sendReply(
+        userId,
+        `ℹ️ 已暂存该会话引用: ${await this.formatSessionLabel(sessionId, resolved.cwd)}`,
+      );
+      return;
+    }
+
+    // The host's candidate label is already the display title; the local path
+    // carries none, so read it once. Either way the id is the fallback so the
+    // mention is never labelled with an empty string.
+    const title = resolved.label
+      ?? (await this.ops.readSessionTitle(sessionId, resolved.cwd, resolved.header))
+      ?? sessionId.slice(0, 12);
+    const label = cleanSessionTitle(title) || sessionId.slice(0, 12);
+    const mention = formatSessionMention(label, sessionId);
+    const staged = this.stageRef(userId, (current) => {
+      current.sessions.push({ sessionId, label, mention });
+    });
+    if (!staged) {
+      await this.sendReply(userId, `⚠️ 已暂存 ${AT_SESSION_LIMIT} 个会话引用，无法再加入。`);
+      return;
+    }
+    const count = this.pendingRefsFor(userId)?.sessions.length ?? 1;
+    this.audit.record({ event: "at-ref", user: maskUserId(userId), kind: "session" });
+    await this.sendReply(
+      userId,
+      `✅ 已引用会话「${label}」（${sessionId.slice(0, 12)}）· ${count}/${AT_SESSION_LIMIT}`
+      + "\n下一条消息会带上它，发送后自动清空。",
+    );
+  }
+
+  /**
+   * Resolve `/at s <target>` to one session id plus its display label.
+   *
+   * A NUMBER resolves through the SAME rows `/s switch` uses (the latest
+   * `/s list` snapshot first), so a number the user just read always addresses
+   * the row they saw.
+   *
+   * A KEYWORD goes through the host's own `listCandidates` when a live agent
+   * exists: it ranks by working-directory affinity and reads titles from
+   * projections only, so one `/at s 报告` costs no log folds. The local
+   * fallback (filter `/s list` rows by title/cwd/id) covers the case where no
+   * agent is live yet, and is deliberately the SAME field set the host
+   * filters on, so the two paths agree.
+   *
+   * Ambiguity is reported as a list, never guessed: with the host path the
+   * rows are not `/s list` numbers, so the hint points at the label instead of
+   * a number that would address a different session.
+   */
+  private async resolveAtSessionTarget(
+    user: UserState,
+    target: string,
+  ): Promise<
+    | {
+        kind: "ok";
+        sessionId: string;
+        label?: string;
+        cwd?: string;
+        /** The row's header when the id came from `/s list` (title-cache lookup). */
+        header?: SessionHeader;
+      }
+    | { kind: "error"; message: string }
+  > {
+    if (/^\d+$/.test(target)) {
+      const rows = (await this.sessionsFromLastList(user)) ?? await this.listRecentSessions(user);
+      if (rows.length === 0) {
+        return { kind: "error", message: "⚠️ 暂无可引用的会话（发送消息即可创建第一个会话）。" };
+      }
+      const index = parseInt(target, 10);
+      if (!Number.isFinite(index) || index < 1 || index > rows.length) {
+        return {
+          kind: "error",
+          message: `⚠️ 编号超出范围（1-${rows.length}）。发送 /s list 查看编号。`,
+        };
+      }
+      const record = rows[index - 1]!;
+      return {
+        kind: "ok",
+        sessionId: record.header.id,
+        header: record.header,
+        ...(record.header.cwd ? { cwd: record.header.cwd } : {}),
+      };
+    }
+
+    const viaHost = await this.hostAtCandidates(user, target);
+    if (viaHost) {
+      if (viaHost.length === 0) {
+        return {
+          kind: "error",
+          message: `⚠️ 没有会话匹配「${target}」。用 /s list 查看编号后用 /at s <编号>。`,
+        };
+      }
+      if (viaHost.length === 1) {
+        return {
+          kind: "ok",
+          sessionId: viaHost[0]!.sessionId,
+          label: viaHost[0]!.label,
+          ...(viaHost[0]!.cwd ? { cwd: viaHost[0]!.cwd } : {}),
+        };
+      }
+      return { kind: "error", message: this.describeAmbiguousAtSessions(viaHost, "再输入更精确的关键词，或 /s list 后用 /at s <编号>") };
+    }
+
+    const rows = await this.listRecentSessions(user);
+    if (rows.length === 0) {
+      return { kind: "error", message: "⚠️ 暂无可引用的会话（发送消息即可创建第一个会话）。" };
+    }
+    const hits = await this.matchAtSessionRows(rows, target);
+    if (hits.length === 0) {
+      return {
+        kind: "error",
+        message: `⚠️ 没有会话匹配「${target}」。用 /s list 查看编号后用 /at s <编号>。`,
+      };
+    }
+    if (hits.length > 1) {
+      const numbered = hits.map((hit) => ({
+        sessionId: hit.header.id,
+        label: cleanSessionTitle(hit.title ?? hit.header.id.slice(0, 12)),
+        cwd: hit.header.cwd,
+        index: rows.indexOf(hit) + 1,
+      }));
+      return { kind: "error", message: this.describeAmbiguousAtSessions(numbered, "例如 /at s 1") };
+    }
+    const hit = hits[0]!;
+    return {
+      kind: "ok",
+      sessionId: hit.header.id,
+      label: hit.title,
+      ...(hit.header.cwd ? { cwd: hit.header.cwd } : {}),
+    };
+  }
+
+  /**
+   * Keyword discovery through `ctx.sessionReferenceResolver`, or `undefined`
+   * when the host cannot answer (no service, no live agent, or the call threw)
+   * so the caller falls back to the local row scan.
+   */
+  private async hostAtCandidates(
+    user: UserState,
+    target: string,
+  ): Promise<Array<{ sessionId: string; label: string; cwd?: string }> | undefined> {
+    const resolver = this.ops.sessionReferenceResolver();
+    const agent = this.agents.get(user);
+    if (!resolver || !agent) return undefined;
+    try {
+      const candidates = await resolver.listCandidates(agent, target, 10);
+      return candidates.map((candidate) => ({
+        sessionId: candidate.sessionId,
+        label: candidate.displayTitle ?? candidate.label,
+        ...(candidate.cwd ? { cwd: candidate.cwd } : {}),
+      }));
+    } catch (err) {
+      this.log(`/at s candidate lookup failed: ${String(err)}`);
+      return undefined;
+    }
+  }
+
+  /** `/s list` rows whose title, cwd, or id contains `target` (case-insensitive). */
+  private async matchAtSessionRows(
+    rows: SessionRecord[],
+    target: string,
+  ): Promise<Array<SessionRecord & { title?: string }>> {
+    const needle = target.toLocaleLowerCase();
+    const facts = await Promise.all(
+      rows.map((record) => this.ops.readSessionTitle(record.header.id, record.header.cwd, record.header)),
+    );
+    const hits: Array<SessionRecord & { title?: string }> = [];
+    rows.forEach((record, i) => {
+      const title = facts[i];
+      const matches = record.header.id.toLocaleLowerCase().includes(needle)
+        || (record.header.cwd ?? "").toLocaleLowerCase().includes(needle)
+        || (title ?? "").toLocaleLowerCase().includes(needle);
+      if (matches) hits.push({ ...record, ...(title ? { title } : {}) });
+    });
+    return hits;
+  }
+
+  /** Numbered ambiguity reply (one line per candidate, capped). */
+  private describeAmbiguousAtSessions(
+    hits: ReadonlyArray<{ sessionId: string; label: string; cwd?: string; index?: number }>,
+    hint: string,
+  ): string {
+    const lines = ["⚠️ 匹配到多个会话，请指定："];
+    for (const hit of hits.slice(0, 10)) {
+      const prefix = hit.index === undefined ? "•" : `${hit.index}.`;
+      lines.push(`${prefix} ${cleanSessionTitle(hit.label)} — ${hit.cwd ?? "?"}`);
+    }
+    lines.push("", hint);
+    return lines.join("\n");
+  }
+
+  /** `/at f …` — resolve, validate, and stage one file/directory reference. */
+  private async stageFileRef(userId: string, user: UserState, rawTarget: string): Promise<void> {
+    const target = normalizeAtTarget(rawTarget);
+    if (!target) {
+      await this.sendReply(
+        userId,
+        '⚠️ 用法: /at f <路径>（相对当前工作区，或绝对路径；含空格用 /at f "a b.txt"）',
+      );
+      return;
+    }
+    const state = this.pendingRefsFor(userId);
+    if (state && state.files.length >= AT_FILE_LIMIT) {
+      await this.sendReply(
+        userId,
+        `⚠️ 已暂存 ${AT_FILE_LIMIT} 个文件引用。先发消息带上它们，或 /at rm <编号> 移除一个。`,
+      );
+      return;
+    }
+
+    const absolute = await canonicalPath(path.isAbsolute(target) ? target : path.resolve(user.cwd, target));
+    let kind: "file" | "directory";
+    try {
+      const stat = await fs.promises.stat(absolute);
+      kind = stat.isDirectory() ? "directory" : "file";
+    } catch {
+      await this.sendReply(userId, await this.describeMissingAtPath(user, target));
+      return;
+    }
+
+    // Deliberately NOT bounded to the working directory. `@文件` is a pointer,
+    // not a read: the host's own `FILE_REFERENCE_PROMPT` tells the model
+    // "absolute paths identify files or directories on the host", and the
+    // agent's sandbox policy — not this bridge — is what decides whether it can
+    // open the file. Refusing a Desktop path here would break the single most
+    // common use ("read this file I just saved"), unlike `send_wechat`, where
+    // the bridge itself reads the bytes and the boundary protects real content.
+    const display = await this.relativeRefPath(user.cwd, absolute);
+    const mention = formatFileMention({ path: display, kind });
+    if (!mention) {
+      await this.sendReply(
+        userId,
+        "⚠️ 该路径含引号或控制字符，无法安全写成 @引用（会截断成普通文本）。请重命名后再试。",
+      );
+      return;
+    }
+    if (state?.files.some((f) => f.path === display)) {
+      await this.sendReply(userId, `ℹ️ 已暂存该文件引用: ${mention}`);
+      return;
+    }
+
+    const staged = this.stageRef(userId, (current) => {
+      current.files.push({ path: display, kind, mention });
+    });
+    if (!staged) {
+      await this.sendReply(userId, `⚠️ 已暂存 ${AT_FILE_LIMIT} 个文件引用，无法再加入。`);
+      return;
+    }
+    const count = this.pendingRefsFor(userId)?.files.length ?? 1;
+    this.audit.record({ event: "at-ref", user: maskUserId(userId), kind: "file" });
+    await this.sendReply(
+      userId,
+      `✅ 已引用${kind === "directory" ? "目录" : "文件"} ${mention} · ${count}/${AT_FILE_LIMIT}`
+      + "\n下一条消息会带上它，发送后自动清空。",
+    );
+  }
+
+  /**
+   * Why a path could not be resolved, with the nearest candidates when they
+   * can be found.
+   *
+   * Two sources, in this order, because each covers what the other cannot:
+   *
+   *   1. the host's `ctx.fileReferences` provider, when a LIVE agent exists —
+   *      it ranks over the whole indexed workspace, which is exactly the
+   *      "fuzzy basename" query a mistyped path is;
+   *   2. a local listing of the parent directory otherwise. `/at f` is often
+   *      the very first thing a user sends, and no agent exists yet at that
+   *      point (`agents.get` needs a bound session), so depending on the
+   *      provider alone would answer the most common case with no help at all.
+   *
+   * Both are advisory: a miss ends with the resolution rule, never a silent
+   * no-op.
+   */
+  private async describeMissingAtPath(user: UserState, target: string): Promise<string> {
+    const lines = [`⚠️ 找不到: ${target}`];
+    // A path that carried invisible marks is worth naming: the user sees a
+    // correct-looking path in WeChat, so "not found" alone reads as a bug.
+    if (hasInvisibleMarks(target)) {
+      lines.push("（该路径含不可见格式字符，如复制路径时带上的 U+202A；请在微信里重新手打，或先粘贴到记事本再复制）");
+    }
+    const suggestions = await this.suggestAtPathCandidates(user, target);
+    if (suggestions.length > 0) {
+      lines.push("", "相近的候选：");
+      for (const suggestion of suggestions) lines.push(`• ${suggestion}`);
+    }
+    lines.push(
+      "",
+      "相对路径从当前工作区解析，例如 /at f src/index.ts",
+      `绝对路径可直接用，例如 /at f C:\\Users\\me\\Desktop\\a.txt（当前工作区: ${user.cwd}）`,
+    );
+    return lines.join("\n");
+  }
+
+  /** Up to five near-match spellings for a path that does not exist. */
+  private async suggestAtPathCandidates(user: UserState, target: string): Promise<string[]> {
+    const agent = this.agents.get(user);
+    const files = this.ops.fileReferences();
+    if (files && agent) {
+      try {
+        const abort = new AbortController();
+        const candidates = await files.list(agent, target, abort.signal);
+        const rendered = candidates
+          .slice(0, 5)
+          .map((candidate) => formatFileMention({ path: candidate.path, kind: candidate.kind }))
+          .filter((mention): mention is string => mention !== undefined);
+        if (rendered.length > 0) return rendered;
+      } catch (err) {
+        this.log(`/at f candidate lookup failed: ${String(err)}`);
+      }
+    }
+    return this.localAtPathCandidates(user, target);
+  }
+
+  /**
+   * Parent-directory listing fallback: the entries of the directory the target
+   * names (or the target's own parent), filtered by the last path segment.
+   *
+   * Advisory only, and deliberately bounded by a small cap. It lists whatever
+   * directory the caller named — the same place `/at f` itself resolves — since
+   * a suggestion for a mistyped absolute path is only useful if it can name the
+   * directory the user actually meant.
+   */
+  private async localAtPathCandidates(user: UserState, target: string): Promise<string[]> {
+    const absolute = path.isAbsolute(target) ? target : path.resolve(user.cwd, target);
+    const fragment = path.basename(absolute).toLocaleLowerCase();
+    let directory = path.dirname(absolute);
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    } catch {
+      // The parent itself may be what is mistyped; retry one level up.
+      directory = path.dirname(directory);
+      try {
+        entries = await fs.promises.readdir(directory, { withFileTypes: true });
+      } catch {
+        return [];
+      }
+    }
+    const matches = entries
+      .filter((entry) => fragment === "" || entry.name.toLocaleLowerCase().includes(fragment))
+      .slice(0, 5);
+    if (matches.length === 0) return [];
+    const out: string[] = [];
+    for (const entry of matches) {
+      const display = await this.relativeRefPath(user.cwd, path.join(directory, entry.name));
+      const mention = formatFileMention({
+        path: display,
+        kind: entry.isDirectory() ? "directory" : "file",
+      });
+      if (mention) out.push(mention);
+    }
+    return out;
+  }
+
+  /**
+   * The path spelling sent to the model: relative to the working directory
+   * when the target lives under it (short, portable, and what the GUI inserts),
+   * otherwise the absolute path (which `FILE_REFERENCE_PROMPT` explicitly
+   * allows). Always `/`-separated so a mention never depends on the host OS.
+   */
+  private async relativeRefPath(cwd: string, absolute: string): Promise<string> {
+    const canonical = await this.canonicalizePaths([cwd]);
+    const root = canonical.get(cwd) ?? path.resolve(cwd);
+    if (!isPathInside(root, absolute)) return absolute.split(path.sep).join("/");
+    const rel = path.relative(root, absolute);
+    return rel === "" ? "." : rel.split(path.sep).join("/");
+  }
+
+  /**
+   * Read a user's staged references, lazily dropping an expired or empty set.
+   *
+   * The returned object IS the map entry (callers mutate it in place for
+   * `/at rm`); nothing outside this file holds a reference across an await.
+   */
+  private pendingRefsFor(userId: string): PendingRefsState | undefined {
+    const state = this.pendingRefs.get(userId);
+    if (!state) return undefined;
+    if (Date.now() - state.at > AT_TTL_MS) {
+      this.pendingRefs.delete(userId);
+      this.log(`/at: dropped expired staged references for ${maskUserId(userId)}`);
+      return undefined;
+    }
+    if (state.sessions.length === 0 && state.files.length === 0) {
+      this.pendingRefs.delete(userId);
+      return undefined;
+    }
+    return state;
+  }
+
+  /**
+   * Stage one reference, enforcing both limits on the post-mutation state.
+   *
+   * Reads through {@link pendingRefsFor} rather than the raw map: an EXPIRED
+   * set must be dropped, not revived. Pushing into the stale entry would
+   * silently re-attach references the user staged twenty minutes ago to the
+   * new one.
+   */
+  private stageRef(userId: string, mutate: (state: PendingRefsState) => void): boolean {
+    const current = this.pendingRefsFor(userId) ?? { sessions: [], files: [], at: Date.now() };
+    const next: PendingRefsState = {
+      sessions: [...current.sessions],
+      files: [...current.files],
+      at: Date.now(),
+    };
+    mutate(next);
+    if (next.sessions.length > AT_SESSION_LIMIT || next.files.length > AT_FILE_LIMIT) return false;
+    this.pendingRefs.set(userId, next);
+    return true;
+  }
+
+  /** `/at rm <n>` — drop the reference at the same position `/at` printed. */
+  private removePendingRef(userId: string, index: number): string {
+    const staged = this.pendingRefsFor(userId);
+    if (!staged) return "📭 当前没有暂存的引用。";
+    const total = staged.sessions.length + staged.files.length;
+    if (index > total) return `⚠️ 编号超出范围（1-${total}）。发送 /at 查看。`;
+    const removed = this.removeRefAt(staged, index);
+    staged.at = Date.now();
+    if (staged.sessions.length === 0 && staged.files.length === 0) {
+      this.pendingRefs.delete(userId);
+    }
+    return `🗑️ 已移除引用 ${index}: ${removed}`;
+  }
+
+  /** Remove one entry by its printed position (sessions first, then files). */
+  private removeRefAt(state: PendingRefsState, index: number): string {
+    if (index <= state.sessions.length) {
+      const [removed] = state.sessions.splice(index - 1, 1);
+      return removed ? `会话「${removed.label}」` : "";
+    }
+    const [removed] = state.files.splice(index - state.sessions.length - 1, 1);
+    return removed ? `文件 ${removed.mention}` : "";
+  }
+
+  /** Drop every staged reference for one user; returns how many were dropped. */
+  private clearPendingRefs(userId: string): number {
+    const state = this.pendingRefs.get(userId);
+    this.pendingRefs.delete(userId);
+    return state ? state.sessions.length + state.files.length : 0;
+  }
+
+  /** Drop one user's staged references (delivery consumed them). */
+  private dropPendingRefs(userId: string): void {
+    this.pendingRefs.delete(userId);
+  }
+
+  /** Drop every user's staged references (identity change). */
+  private dropAllPendingRefs(): void {
+    this.pendingRefs.clear();
+  }
+
+  /** `/at` reply: the numbered staging table, or the usage text. */
+  private formatStagedRefs(userId: string): string {
+    const staged = this.pendingRefsFor(userId);
+    if (!staged) {
+      return [
+        "📭 当前没有暂存的引用。",
+        "",
+        "用法：",
+        "• /at s <编号|关键词> — 引用其它会话（编号来自 /s list）",
+        "• /at f <路径> — 引用文件或目录（含空格用 /at f \"a b.txt\"）",
+        "• /at — 查看暂存；/at rm <编号> 移除；/at clear 清空",
+        "",
+        "暂存的引用会附加到下一条消息上（最多 3 个会话、8 个文件，10 分钟内有效）。",
+      ].join("\n");
+    }
+    const lines = ["📎 已暂存的引用（下一条消息生效）"];
+    let n = 1;
+    for (const ref of staged.sessions) {
+      lines.push(`${n++}. 会话: ${ref.label}（${ref.sessionId.slice(0, 12)}）`);
+    }
+    for (const ref of staged.files) {
+      lines.push(`${n++}. 文件: ${ref.mention}`);
+    }
+    lines.push(
+      "",
+      `会话 ${staged.sessions.length}/${AT_SESSION_LIMIT} · 文件 ${staged.files.length}/${AT_FILE_LIMIT}`
+      + `，${Math.max(1, Math.round(AT_TTL_MS / 60_000))} 分钟内有效。`,
+      "/at rm <编号> 移除 · /at clear 清空",
+    );
+    return lines.join("\n");
+  }
+
+  /** `/status` row for staged `/at` references (only rendered when non-empty). */
+  private describeStagedRefs(state: PendingRefsState): string {
+    const parts: string[] = [];
+    if (state.sessions.length > 0) parts.push(`会话 ${state.sessions.length}`);
+    if (state.files.length > 0) parts.push(`文件 ${state.files.length}`);
+    return `• 引用暂存: ${this.paintBadge(parts.join(" · "), "positive")}（下一条消息生效，/at 查看）`;
   }
 
   // ─── History ──────────────────────────────────────────────────────────────
@@ -4274,7 +6028,7 @@ export class WeChatDSHBridge {
         // default, so `/status` (which reads the override via
         // `resolveEffectiveModel`) keeps showing the effort.
         const existingEffort =
-          (agent ? this.modelOverrides.get(agent.id)?.reasoningEffort : undefined) ??
+          (agent ? this.resolveEffectiveModel(user, agent)?.reasoningEffort : undefined) ??
           this.ops.defaultModelSelection()?.reasoningEffort;
         let preservedEffort: string | undefined;
         let preservedLabel: string | undefined;
@@ -4290,12 +6044,33 @@ export class WeChatDSHBridge {
           preservedEffort !== undefined
             ? { provider: matchedProvider.id, model: matchedModel.id, reasoningEffort: preservedEffort }
             : { provider: matchedProvider.id, model: matchedModel.id };
+        // Host-first as above: one durable selection shared with the GUI.
+        // Without `sessionController` the legacy request override remains
+        // the only way to affect a live agent on older hosts.
+        let appliedToGui = false;
+        let saved: boolean;
         if (agent) {
-          this.modelOverrides.set(agent.id, selection);
+          const applied = await this.ops.selectSessionModel(agent.id, selection);
+          if (applied.kind === "error") {
+            await this.sendReply(userId, `⚠️ 无法切换模型: ${applied.message}`);
+            return;
+          }
+          if (applied.kind === "host") {
+            // The Host's selectModel already queues the default save; keep
+            // one writer so the profile is not rewritten twice per switch.
+            this.modelOverrides.delete(agent.id);
+            appliedToGui = true;
+            saved = true;
+          } else {
+            this.setModelOverride(agent.id, selection);
+            saved = await this.ops.saveDefaultModel(selection);
+          }
+        } else {
+          saved = await this.ops.saveDefaultModel(selection);
         }
-        const saved = await this.ops.saveDefaultModel(selection);
         const lines = [`✅ 已切换到模型: ${matchedProvider.id}/${matchedModel.id}`];
-        if (agent) lines.push("（已应用到当前会话，下一步生效）");
+        if (agent && appliedToGui) lines.push("（已同步到 GUI 的模型选择器）");
+        else if (agent) lines.push("（已应用到当前会话，下一步生效）");
         if (preservedLabel) {
           lines.push(`（推理等级 ${preservedLabel} 保留，用 /reasoning 调整）`);
         }
@@ -4398,7 +6173,37 @@ export class WeChatDSHBridge {
           await this.sendReply(userId, `⚠️ 未知权限预设: ${cmd.target}。可用: ${service.names.join(", ")}`);
           return;
         }
+        // S1: the default is GLOBAL and PERSISTENT — it is written into the
+        // `permission` settings document and applies to every session this
+        // DSH install creates from now on, WeChat-related or not. A chat
+        // message proving possession of a WeChat account must therefore not be
+        // able to raise it; a de-escalating write is still allowed.
+        if (!this.config.allowRemotePermissionEscalation && this.isEscalatingPreset(service, name)) {
+          this.audit.record({
+            event: "perm-default-refused",
+            user: maskUserId(userId),
+            preset: name,
+            reason: "escalation",
+          });
+          await this.sendReply(
+            userId,
+            [
+              `⛔ 已拒绝：${this.describePermission(service, name)} 会放宽**全局**默认权限。`,
+              "该默认值写入 DSH 设置，对所有新会话生效（与微信无关），属于提权操作，只能在本机界面完成。",
+              "请打开 DSH 界面 → 设置 → 权限（Permission）→ 默认预设，选择该预设并保存。",
+              "会话级切换不受影响：/perm switch <名称> 只作用于当前会话。",
+              "如确实需要微信端修改全局默认，请在设置页开启「允许微信放宽全局默认权限」（配置键 allowRemotePermissionEscalation）。",
+            ].join("\n"),
+          );
+          return;
+        }
         const saved = await this.ops.saveDefaultPermission(name);
+        this.audit.record({
+          event: "perm-default-set",
+          user: maskUserId(userId),
+          preset: name,
+          ...(this.config.allowRemotePermissionEscalation ? { via: "allowRemotePermissionEscalation" } : {}),
+        });
         const lines = [`✅ 新会话默认权限已设为: ${this.describePermission(service, name)}`];
         if (saved) {
           lines.push("（已写入 DSH 设置，与 GUI 设置页同步，新会话生效）");
@@ -4459,6 +6264,36 @@ export class WeChatDSHBridge {
   }
 
   /**
+   * Whether a preset is an ESCALATION, read from the same knob bundle the
+   * host applies (`permissionPresets.resolve(name)` → `{ sandbox, approval }`,
+   * the schema of `@deepseek-ai/dsh-permission-presets`):
+   *
+   *   - `sandbox === "danger-full-access"` — no filesystem confinement, or
+   *   - `approval === "never"` — no approval prompt will ever be shown,
+   *     regardless of what the sandbox refuses.
+   *
+   * Both knobs are read on purpose: the host ships `danger-full-access` as
+   * `{sandbox: danger-full-access, approval: never}` and `auto` as
+   * `{sandbox: danger-full-access, approval: ask}`, so keying on the sandbox
+   * alone would miss a config-declared preset that only drops approvals.
+   *
+   * A preset whose bundle cannot be resolved counts as escalating: an
+   * unreadable knob bundle must not be written globally just because we could
+   * not prove it is dangerous.
+   */
+  private isEscalatingPreset(
+    service: { resolve(name: string): { sandbox: string; approval: string } },
+    name: string,
+  ): boolean {
+    try {
+      const spec = service.resolve(name);
+      return spec.sandbox === "danger-full-access" || spec.approval === "never";
+    } catch {
+      return true;
+    }
+  }
+
+  /**
    * Apply the user's model override to a frozen request config. Called from
    * the `agent/request` waterfall listener (registered in index.ts) for
    * WeChat-bound agents. An override without a reasoning effort leaves the
@@ -4484,6 +6319,21 @@ export class WeChatDSHBridge {
       model: override.model,
       ...(override.reasoningEffort !== undefined ? { reasoningEffort: override.reasoningEffort } : {}),
     };
+  }
+
+  /**
+   * Record one session's model override under a hard FIFO cap.
+   *
+   * The map is keyed by session id and nothing ever removed an entry, so a
+   * long-lived install with many sessions kept every override alive for the
+   * process lifetime. The cap bounds it; eviction is deterministic (oldest
+   * written first) and only affects sessions that have not had `/model` or
+   * `/reasoning` touched in the last {@link MODEL_OVERRIDE_MAX_SESSIONS}
+   * writes — for those, the model falls back to the persisted default, which
+   * `/model switch` writes in the same breath.
+   */
+  private setModelOverride(agentId: string, override: ModelOverride): void {
+    this.boundedSet(this.modelOverrides, agentId, override, MODEL_OVERRIDE_MAX_SESSIONS, "modelOverrides");
   }
 
   /**
@@ -4536,6 +6386,7 @@ export class WeChatDSHBridge {
     }
 
     const crossEffective = this.shouldNotifyCrossSession(user.userId) ? "on" : "off";
+    const stagedRefs = this.pendingRefsFor(user.userId);
     const presetLines = await this.formatStatusPresetLines(user);
     const pendingLines = this.formatPendingStatusLines(user.userId);
     const agentLabel = agent
@@ -4564,6 +6415,24 @@ export class WeChatDSHBridge {
         : [`• 结论模式: ${this.paintBadge("off", "neutral")}`]),
       `• 微信提示词: ${this.paintBadge(this.config.surfacePromptEnabled ? "on" : "off", this.config.surfacePromptEnabled ? "positive" : "neutral")}`,
       `• 繁忙投递: ${this.ops.busyEnter() === "steer" ? this.paintBadge("steer（插话）", "positive") : this.paintBadge("queue（排队）", "neutral")}`,
+      // 打字合并 (F1) — shows the live parameters AND the buffered count, so
+      // the window is never a black box the user has to guess about.
+      `• 打字合并: ${this.mergeEnabled() ? this.paintBadge(this.mergeStatusText(), "positive") : this.paintBadge("off", "neutral")}`,
+      // 图片/文件合并 — shown always (unlike `/at` staging) because the
+      // delivery style applies to every attachment and is worth knowing at a
+      // glance; the held count appears only while something is actually held.
+      `• 图片/文件合并: ${this.mediaMergeEnabled() ? this.paintBadge(this.mediaMergeStatusText(), "positive") : this.paintBadge(this.mediaMergeStatusText(), "neutral")}`,
+      // `/at` staging is only shown while something IS staged: an always-on
+      // "引用暂存: 0" row would be one more line on every `/status` for a
+      // feature most turns never use.
+      ...(stagedRefs ? [this.describeStagedRefs(stagedRefs)] : []),
+      // Inbound allowlist (S3): the owner's own id is printed in full here — on
+      // purpose, because "never require the user to know their own id" — while
+      // logs only ever carry the masked form.
+      `• 入站白名单: ${this.describeAllowlist(user.userId)}`,
+      // Audit trail location: the trail exists for the operator, who has to be
+      // able to find it without reading the source.
+      `• 审计日志: ${this.audit.path()}（按 1 MiB 轮转为 .1）`,
       // 跨会话决策推送 on = extra delivery enabled (good); off = quiet (neutral).
       `• 跨会话决策推送: ${this.paintBadge(crossEffective, crossEffective === "on" ? "positive" : "neutral")}`,
       `• 跨会话任务完成提醒: ${this.paintBadge(this.notifyTaskEventsEnabled() ? "on" : "off", this.notifyTaskEventsEnabled() ? "positive" : "neutral")}`,
@@ -4598,6 +6467,21 @@ export class WeChatDSHBridge {
     }
 
     return lines.join("\n");
+  }
+
+  /**
+   * `/status` inbound-allowlist row (S3). When the list is empty the row says
+   * so explicitly — "first contact wins" is a security-relevant state and must
+   * be visible; when it is set, the bound peer's OWN id is printed in full so
+   * the owner never has to discover their id elsewhere to edit the list.
+   */
+  private describeAllowlist(ownUserId: string): string {
+    const allowed = this.config.allowedUsers;
+    if (allowed.length === 0) {
+      return this.paintBadge("关（首位给你发消息的人会成为绑定对端）", "warning");
+    }
+    const own = allowed.includes(ownUserId) ? " ◀ 当前绑定" : "";
+    return `${allowed.join(", ")}${own}（其他人发消息会被忽略，不回复）`;
   }
 
   /** `/status` rows for unanswered cards, split into current vs other sessions. */
@@ -4686,10 +6570,15 @@ export class WeChatDSHBridge {
   }
 
   /**
-   * The model the user's session actually runs on: this session's override
-   * (`/model switch`) > the session's latest logged request config > the
-   * agent's creation options > the deployment default model. Same precedence
-   * as the GUI's `selectionFor`.
+   * The model the user's session actually runs on, in host-equivalent
+   * precedence: a legacy in-memory override (only set when the deployment has
+   * no `sessionController`) > the Session's durable `modelSelection`
+   * projection (`next`, falling back to `lastUsed`) > the latest logged
+   * request config > the agent's creation options > the deployment default.
+   * The projection is the same value the GUI picker shows and
+   * `sessionController.selectModel` installs, so a switch from either surface
+   * is reflected by `/status`, `/model status`, and `/reasoning status`
+   * immediately.
    *
    * `reasoningEffort` follows the same precedence chain, with one defensive
    * branch: when the override carries a model selection but no effort AND
@@ -4720,6 +6609,16 @@ export class WeChatDSHBridge {
       }
       return override;
     }
+    // Host-owned durable selection (`model/selection` event folded into the
+    // `modelSelection` projection). This is the value the GUI picker shows
+    // and `sessionController.selectModel` installs, so reading it here makes
+    // `/status`, `/model status` and `/reasoning status` follow a GUI switch
+    // immediately — while the old request-header read only saw the model
+    // after the next GUI turn had already run.
+    const projected = agent?.session
+      ? this.ops.sessionModelSelection(agent.session as unknown as AgentSessionLike)
+      : undefined;
+    if (projected?.provider && projected.model) return projected;
     const logged = agent?.session?.requestHeader?.()?.config;
     if (logged?.provider && logged.model) return logged;
     if (agent?.options?.provider && agent.options.model) return agent.options;
@@ -4727,6 +6626,91 @@ export class WeChatDSHBridge {
   }
 
   // ─── send-wechat tool ───
+
+  /** Effective outgoing-file size ceiling (bytes); malformed config falls back to the default. */
+  private maxOutgoingFileBytes(): number {
+    const value = this.config.maxOutgoingFileBytes;
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? value
+      : defaultConfig().maxOutgoingFileBytes;
+  }
+
+  /** Size of a file in bytes, or undefined when it cannot be stat'ed. */
+  private async outgoingFileSize(filePath: string): Promise<number | undefined> {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      return stat.isFile() ? stat.size : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Roots an outgoing file may live under: the working directory of the
+   * session that is ACTUALLY sending, plus every registered workspace.
+   *
+   * The sender is resolved from the calling agent id — never from the
+   * recipient fallback. Those are different questions: an unbound (GUI)
+   * session still sends to the first known WeChat user, and the file bound
+   * must be the CALLER's, otherwise any session could read any other
+   * session's workspace by relying on the recipient fallback.
+   */
+  private async outgoingFileRoots(senderAgentId: string): Promise<string[]> {
+    const roots = new Set<string>();
+    if (senderAgentId) {
+      try {
+        const live = this.ctx.get<{ get(id: string): Agent | undefined }>("agents")?.get(senderAgentId);
+        const liveCwd = live?.session?.header?.cwd;
+        if (typeof liveCwd === "string" && liveCwd) roots.add(liveCwd);
+      } catch {
+        // A host without the live header simply falls through to the roster.
+      }
+      const record = await this.ops.findSessionRecord(senderAgentId);
+      if (record?.header.cwd) roots.add(record.header.cwd);
+      const bound = this.userForAgent(senderAgentId);
+      if (bound?.cwd) roots.add(bound.cwd);
+    }
+    for (const workspace of this.ops.listWorkspaces()) {
+      if (workspace.path) roots.add(workspace.path);
+    }
+    return [...roots];
+  }
+
+  /**
+   * Validate one `send_wechat` file: it must exist, be a regular file, fit in
+   * {@link maxOutgoingFileBytes}, and — unless `allowAnyFilePath` is set —
+   * resolve inside one of {@link outgoingFileRoots}.
+   *
+   * @returns `undefined` when the file may be sent, else the refusal message
+   *   the tool returns verbatim.
+   */
+  private async guardOutgoingFile(senderAgentId: string, filePath: string): Promise<string | undefined> {
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(filePath);
+    } catch {
+      return `file not found: ${filePath}`;
+    }
+    if (!stat.isFile()) return `not a regular file: ${filePath}`;
+    const max = this.maxOutgoingFileBytes();
+    if (stat.size > max) {
+      return `file too large: ${filePath} is ${stat.size} bytes (limit ${max}; raise maxOutgoingFileBytes in the plugin settings)`;
+    }
+    if (this.config.allowAnyFilePath) return undefined;
+    // Canonicalize BOTH sides: a symlink inside the workspace pointing at
+    // /etc/shadow must not pass, and `..` must not escape.
+    const target = await canonicalPath(filePath);
+    const roots = await this.outgoingFileRoots(senderAgentId);
+    for (const root of roots) {
+      const canonicalRoot = await canonicalPath(root);
+      if (isPathInside(canonicalRoot, target)) return undefined;
+    }
+    const where = roots.length > 0 ? roots.join(", ") : "(no session cwd and no registered workspace)";
+    return (
+      `refused: ${filePath} is outside the calling session's workspace. `
+      + `Allowed roots: ${where}. Move the file there, or set allowAnyFilePath=true in the plugin settings to allow any path.`
+    );
+  }
 
   /**
    * Handle the `send_wechat` tool: push text or a local file to a
@@ -4742,6 +6726,12 @@ export class WeChatDSHBridge {
    * over delivery, and an error result would only tempt the model into
    * retrying (→ duplicate deliveries on flush). Only an unreadable
    * `file_path` returns `ok: false` immediately.
+   *
+   * S2: `file_path` is NOT an arbitrary-file-read primitive. The path is
+   * validated against the sending session's workspace (and every registered
+   * workspace) with a size ceiling before anything is read or queued; the
+   * check happens against the CALLER, not against the recipient fallback, so
+   * an unbound session cannot borrow another session's roots.
    */
   async handleSendWeChat(agentId: string, args: { text?: string; file_path?: string }): Promise<{ ok: boolean; message: string }> {
     const user = this.resolveUserForAgent(agentId);
@@ -4777,6 +6767,28 @@ export class WeChatDSHBridge {
     if (args.file_path) {
       const filePath = args.file_path;
       const fileName = filePath.split(/[\\/]/).pop() ?? "file";
+      // S2: validate BEFORE reading/queueing anything. The bound is evaluated
+      // against the CALLING session (`agentId`), not against the recipient
+      // fallback resolved above.
+      const refusal = await this.guardOutgoingFile(agentId, filePath);
+      if (refusal) {
+        this.log(`send_wechat file refused: ${refusal}`);
+        this.audit.record({
+          event: "send_wechat-file",
+          user: maskUserId(user.userId),
+          sender: maskUserId(agentId),
+          path: filePath,
+          result: "refused",
+        });
+        return { ok: false, message: refusal };
+      }
+      this.audit.record({
+        event: "send_wechat-file",
+        user: maskUserId(user.userId),
+        sender: maskUserId(agentId),
+        path: filePath,
+        result: "allowed",
+      });
       // Send images/videos with their native media type so WeChat renders
       // them inline; everything else goes as a file attachment.
       const mediaType = mediaTypeForFile(fileName);
@@ -4785,6 +6797,14 @@ export class WeChatDSHBridge {
       if (outcome === "failed") {
         if (this.tokenGiveUp) {
           return { ok: false, message: "WeChat bot token is invalid; re-scan the QR code" };
+        }
+        // Distinguish "grew past the cap between the guard and the read" from
+        // a genuinely unreadable path — the log line is precise, the tool
+        // result should be too.
+        const size = await this.outgoingFileSize(filePath);
+        const max = this.maxOutgoingFileBytes();
+        if (size !== undefined && size > max) {
+          return { ok: false, message: `file too large: ${filePath} is ${size} bytes (limit ${max}; raise maxOutgoingFileBytes in the plugin settings)` };
         }
         return { ok: false, message: `file not found: ${filePath}` };
       }
@@ -4834,7 +6854,32 @@ export class WeChatDSHBridge {
       : this.deliverOutboundLocked(userId, item, opts));
   }
 
+  /**
+   * One outbound attempt, audited. Split from the body so EVERY caller —
+   * `deliverOutbound`, `sendReply`'s batch and `flushPendingLocked` — records
+   * exactly one line per attempt without sprinkling audit calls over a dozen
+   * early returns. Body contents are never recorded: kind, size and outcome
+   * only.
+   */
   private async deliverOutboundLocked(
+    userId: string,
+    item: CachedMessage,
+    opts?: { parkOnError?: boolean },
+  ): Promise<"sent" | "cached" | "failed"> {
+    const outcome = await this.deliverOutboundLockedBody(userId, item, opts);
+    this.audit.record({
+      event: "outbound",
+      user: maskUserId(userId),
+      kind: item.kind,
+      ...(item.kind === "text" ? { chars: item.text.length } : { file: item.fileName }),
+      result: outcome,
+      ...(outcome === "sent" ? { windowCount: this.wechatMsgCount } : {}),
+      ...(outcome === "cached" ? { queueLength: this.outboundCache.length } : {}),
+    });
+    return outcome;
+  }
+
+  private async deliverOutboundLockedBody(
     userId: string,
     item: CachedMessage,
     opts?: { parkOnError?: boolean },
@@ -4856,6 +6901,16 @@ export class WeChatDSHBridge {
     // Validate file paths before consuming budget or poisoning the durable queue.
     let buffer: Buffer | undefined;
     if (item.kind === "file") {
+      // Size ceiling at the READ site too, not only at the tool entry: a
+      // cached item outlives restarts (state.json) and a file can grow after
+      // it was queued. `stat` before `readFile` so an oversized file is never
+      // pulled into memory at all.
+      const size = await this.outgoingFileSize(item.filePath);
+      const max = this.maxOutgoingFileBytes();
+      if (size !== undefined && size > max) {
+        this.log(`drop outbound file (${size} bytes > ${max} limit): ${item.fileName}`);
+        return "failed";
+      }
       try {
         buffer = await fs.promises.readFile(item.filePath);
       } catch (err) {
@@ -5093,6 +7148,15 @@ export class WeChatDSHBridge {
           });
         } else {
           let buffer: Buffer;
+          const size = await this.outgoingFileSize(msg.filePath);
+          const max = this.maxOutgoingFileBytes();
+          if (size !== undefined && size > max) {
+            this.log(`flush dropping oversized cached file (${size} bytes > ${max} limit): ${msg.fileName}`);
+            dropped++;
+            this.outboundCache.shift();
+            this.persistOutboundState(userId);
+            continue;
+          }
           try {
             buffer = await fs.promises.readFile(msg.filePath);
           } catch (err) {
@@ -5168,6 +7232,17 @@ export class WeChatDSHBridge {
 }
 
 /**
+ * Flatten staged references into the render list `buildMentionBlock` takes
+ * (sessions first, then files — the same order `/at` numbers them).
+ */
+function stagedRefList(state: PendingRefsState): StagedReference[] {
+  return [
+    ...state.sessions.map((s): StagedReference => ({ kind: "session", mention: s.mention })),
+    ...state.files.map((f): StagedReference => ({ kind: "file", mention: f.mention })),
+  ];
+}
+
+/**
  * Clean a session title for WeChat display: strip legacy per-message hint
  * blocks (pre-fix sessions), collapse newlines/whitespace, and truncate.
  */
@@ -5205,6 +7280,20 @@ async function canonicalPath(p: string): Promise<string> {
   } catch {
     return path.resolve(p);
   }
+}
+
+/**
+ * Whether `target` is `root` itself or lives beneath it. Both paths are
+ * expected to be canonical (see {@link canonicalPath}); the comparison is
+ * segment-aware through `path.relative`, so `/work-evil` is NOT considered
+ * inside `/work` and a sibling `..` escape is rejected. `relative` returning
+ * an absolute path (different Windows drive) also fails the check.
+ */
+function isPathInside(root: string, target: string): boolean {
+  if (!root || !target) return false;
+  const rel = path.relative(root, target);
+  if (rel === "") return true;
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 /**

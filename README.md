@@ -4,80 +4,32 @@
 [![npm downloads](https://img.shields.io/npm/dm/dsh-wechat?style=flat-square&logo=npm)](https://www.npmjs.com/package/dsh-wechat)
 [![License](https://img.shields.io/github/license/pan17/dsh-wechat?style=flat-square)](https://github.com/pan17/dsh-wechat)
 
-让微信成为 DeepSeek Harness (DSH) 的第二客户端：通过腾讯 iLink bot 协议把
-微信私聊桥接到 DSH agent——文本/图片/文件/语音消息双向收发、微信内 slash
-命令管理会话/工作区/Preset/模型/权限、审批与提问卡与 GUI 双端同卡同决策、
-DSH 设置页内扫码登录与连接配置。以静态 Cordis 插件交付，零运行时
-`@deepseek-ai` 依赖，直接调用 DSH 进程内服务。
+把微信变成 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) 的第二客户端：在微信里和你的 agent 聊天，收发文字、图片、文件和语音，用 slash 命令管理会话、工作区、模型与权限，审批卡和提问卡在微信与桌面端同步弹出。
 
 <img src="./resources/send.jpg" alt="发送" width="32%" /> <img src="./resources/receive.jpg" alt="接收" width="32%" /> <img src="./resources/settings.png" alt="设置页" width="32%" />
 
 ![Workflow diagram for dsh-wechat: install → open panel → act.](docs/assets/dsh-wechat-flow.svg)
 
-*Workflow overview: install → open panel → act. The examples below use the real command surface.*
+微信与 DSH 双向同步：文字、图片、文件、语音直接发给 agent，回复与执行过程推回微信，审批卡和提问卡两端同弹、谁先答谁生效；`/at` 可引用其它会话或文件，把几条消息或「截图 + 问题」合成一轮，静默模式与结论模式控制推送频率；会话、工作区、Preset、模型、权限都能在微信里用 slash 命令管理，与 GUI 同源；另有秘密脱敏、文件范围限制、入站白名单与审计日志等边界，以及内嵌在 DSH 设置里的扫码登录、配置页与**指令帮助**（每条指令一句说明，点开看全部例子、点一下复制）。
 
-## 安装（部署到 DSH profile）
+## 安装
 
-当前版本要求 **DSH `>=0.2.1-0`（且 `<0.3.0-0`）**。这条要求写了两处：`engines.dsh`（供插件市场展示，宿主不读）与 `peerDependencies["@deepseek-ai/dsh"]`（宿主**强制校验**——不匹配会跳过整个插件包）。低于 `0.2.1-0` 或高于 `0.2.x` 的 DSH 会被拒绝加载。
+要求 DSH `>=0.2.1-0 <0.3.0-0`。
 
-### 方式一：设置页内直接安装（推荐）
+> **本仓库是 PerryLink 的 fork，不发布 npm 包。** npm 上的 `dsh-wechat` 由上游
+> [pan17/dsh-wechat](https://github.com/pan17/dsh-wechat) 发布；下面的安装命令装的是上游包。
+> 本 fork 用于向上游提交 PR 和本地验证，不提供独立的 npm 版本。
 
-打开 **设置 → 插件 → 添加插件**，在输入框填包名：
+**方式一：设置页**（推荐）— 打开 **设置 → 插件 → 添加插件**，填 `dsh-wechat`，点安装，然后重启 DSH。国内网络慢时把安装源切到**中国大陆镜像源**。
 
-```text
-dsh-wechat
-```
-
-点「安装」即可。插件声明了 `dsh.bundle`，安装时会被自动注册成 bundle 层，
-不需要再手动改 profile 配置。国内网络下载慢时，把「安装源」切到
-**中国大陆镜像源**。
-
-安装完成后若提示「已安装，下次启动后加载」，重启 DSH 即可；若出现
-「立即启用」按钮，也可以直接点它免重启。
-
-然后浏览器打开 **设置 → WeChat**：扫码登录、查看状态、改配置，或直接访问
-`http://127.0.0.1:3080/wechat/qr` 扫码。
-
-### 方式二：命令行
-
-DSH 自带插件管理命令 `dsh plugin`（在 profile 目录转发 pnpm，并自动把
-声明了 `dsh.bundle` 的依赖加入 bundle 层）：
-
-> ⚠️ **别用** `npx dsh plugin`——npm 上 `dsh` 这个名字早在 2016 年就被一个不相关的 JS shell 包占了（`dsh@1.0.1`，作者 `infusion`），它没暴露 CLI bin，会报 `could not determine executable to run`。DSH 的 CLI 在 scoped 包 `@deepseek-ai/dsh` 下，必须用完整名。
-
-桌面版（Electron）用户请直接用应用自带的 `dsh` 命令（安装桌面版时会加入 PATH），
-它支持 `--profile desktop`：
+**方式二：命令行**（桌面版）
 
 ```bash
-# 安装（自动添加依赖 + 注册 bundle 层）
 dsh plugin --profile desktop add dsh-wechat
-
-# 查看已装版本
-dsh plugin --profile desktop list --depth 0
-
-# 重启 DSH
+dsh plugin --profile desktop list --depth 0    # 查看已装版本
 ```
 
-其他管理命令（同样自动维护 bundle 层）：
-
-```bash
-dsh plugin --profile desktop update dsh-wechat   # 升级
-dsh plugin --profile desktop remove dsh-wechat   # 卸载（从 bundles 移除）
-```
-
-> `--dump-config` 在 `desktop` profile 上会被拒绝（该 profile 由 Electron 应用
-> 独占管理），要验证组合配置请改用 `dsh plugin --profile desktop list`，
-> 或在设置页查看。
->
-> 非桌面版（`web` / `tui` / `headless` 等自建 profile）用 scoped CLI：
->
-> ```bash
-> npx @deepseek-ai/dsh plugin --profile web add dsh-wechat
-> npx @deepseek-ai/dsh --profile web --dump-config   # 应看到 "- id: dsh-wechat" 行
-> ```
-
-> 插件从 npm 官方源安装（`dsh plugin add` 即 `pnpm add dsh-wechat`）。
-> 修改代码后需**重启 DSH** 才能让改动生效。
+安装后打开 **设置 → WeChat** 扫码登录（也可直接访问 `http://127.0.0.1:3080/wechat/qr`）。
 
 ## 功能
 
@@ -108,360 +60,47 @@ dsh plugin --profile desktop remove dsh-wechat   # 卸载（从 bundles 移除�
 
 ## 微信命令
 
-### 与 DSH 原生命令同步
-
-<details>
-<summary>点击展开：bridge 如何接入 DSH 的 <code>ctx.commands</code> 注册中心（计划模式 / 目标 / 压缩 等原生 slash 命令走的就是这条路）</summary>
-
-微信消息进入后，bridge **先**向 DSH 的 `ctx.commands` 注册中心查询当前会话
-已注册的命令（这是 DSH 内置的人类 slash 命令注册服务，由 `@deepseek-ai/dsh-commands`
-提供；`name` /plan、`name` /goal、`name` /compact 等命令都由各自的 bundle 在那里
-注册）。命中即直接交给原生 handler 执行，并把结果回执渲染到微信——和 GUI 走同
-一条命令管线。
-
-未注册的命令回落到本仓库硬写的本地命令表（`/silent`、`/next`、`/rq`、
-/workspace、`/session` 等），命中失败时按 "未知命令" 提示并作为文本转发给 agent。
-DSH 的 `ctx.commands` 服务在某些极简装配下可能不挂载（缺失时会打一次 warn），
-这种情形行为完全等同之前的版本。
-
-所以：**DSH 加任何新的 `/xxx` 命令 bundle，微信端无需改动即可识别**——只要它是
-按 DSH 命令注册契约挂上去的。例如装有 `dsh-plan-mode` 时微信发 `/plan off` 收
-到原生回执 "Plan mode off."；装有 `dsh-command-goal` 时 `/goal <目标>` 收到原生
-"Goal created ..."；装有 `dsh-command-compact` 时 `/compact` 收到 "Compacted N
-history items (~M tokens)."——与 GUI 同款回执，由原生 handler 自己算、自己发。
-
-`/help` 在末尾加一段 `── DSH 原生命令（当前 profile 已注册）──`，列出当前
-profile 实际注册的所有原生命令；本地命令表里已有的名字自动去重，不会重复
-出现。
-
-</details>
-
-### 本地命令表
-
 | 命令 | 说明 |
 |---|---|
-| `/help`（`/h`、`/?`） | 帮助 |
-| `/status` | 当前状态：工作区、会话、Agent、待处理(当前)/待处理(跨会话)、当前会话 Preset、模型、上下文、权限、默认 Preset、静默、结论模式、繁忙投递、跨会话决策推送、跨会话任务完成提醒；末尾追加 DSH 通过 `ctx.sessionProjections` 注册的所有会话级状态，分四段显示——`[模式]`（plan / goal / subagent / todos）、`[用量与统计]`（tokenUsage / contextPressure / contextBreakdown / sessionStats / subagentTiming）、`[会话]`（title / sessionListMetadata / permissions / imageLimits）、`[其它]`（未识别 key 自动归类）；DSH 加新 plugin 自动出现 |
-| `/workspace (ws) — list [all\|数量] \| status \| switch <编号\|路径> \| add <路径>` | 工作区管理（list 默认显示 20 个、按添加顺序（新加的排最前），`all` 或显式数量看更多；显示各工作区会话数，不含已归档；switch/add 回复会写明恢复的会话名字和完整 id，跳过已归档；该目录无可见会话时提示发送消息将创建） |
-| `/session (s) — list [current] [all\|数量] \| switch [current] <编号> \| pin [编号] \| unpin [编号] \| new \| status` | 会话管理（list 默认显示最近 20 个，`all` 或显式数量看更多，标记当前，不显示 GUI 已归档会话；**置顶会话排在列表最前并标 `📌`**，`pin`/`unpin` 省略编号时作用于当前会话，带编号时按 `/s list` 的行号解析；`list current` 只看当前工作目录——cwd 按宿主 `fs.promises.realpath` 规则归一（尾斜杠/`..`/大小写差异都能匹配），推荐用 `switch current <编号>` 按同一列表切换；紧接着直接 `switch <编号>` 也会复用最近一次列表编号；普通无列表上下文时 `switch <编号>` 对应全量列表；switch 回复同时带会话名字和完整 id；`new` 复用当前工作区空白会话，与 GUI「新建会话」同款，无空白才新建） |
-| `/preset (p) — list \| switch <名称\|编号> \| status` | 默认 Preset（写入 DSH 设置，与 GUI 同步；`status` 看全局默认，不是当前会话；当前会话无内容时 `switch` 立即应用） |
-| `/model — list [提供商] \| switch <提供商/模型> \| status` | 模型管理（切换立即作用于当前会话 + 设为默认；当前推理等级若新模型支持则一并保留，否则清空） |
-| `/perm — status \| list \| switch <名称\|编号> \| default [名称\|编号]` | 权限管理（switch 实时切当前会话；default 写 DSH 设置，新会话生效） |
-| `/reasoning — [list \| default \| switch <等级>]` | 推理等级：查看当前/默认与模型支持的等级；`switch <等级>` 切换（实时 + 写默认）；`default` 恢复模型默认 |
-| `/enter queue\|steer\|status`（`/busy`） | 繁忙时投递：agent 运行中收到微信消息时排队（`queue`）还是插话进当前轮次（`steer`）；读写 DSH 设置 `ui-conversation.busyEnter`，与 GUI「繁忙时 Enter 键行为」同源同步；空闲会话始终新开一轮 |
-| `/silent on\|off`（`/sl`） | 静默模式：开启后仅在轮次结束发送最后一条助手正文；关闭后思考与工具合并为「执行过程」，正文独立发送；写入 `config.json`，重新扫码后仍保留，设置页可切换。⚠️ 单位是「轮」——一次需求若被拆成多轮（例如目标自动续跑 8 轮），仍会收到 8 条；要按「任务」只收一条请用结论模式（`/final on`） |
-| `/final on\|off\|status`（`/fo`） | 结论模式开关：开启后跨轮次暂存，整条任务停下后只发一条最终结论（优先于 `/silent`）；`off` 会把**当前暂存的内容先交付**再关闭（暂存是 agent 已经产出的结论，关掉不该把它销毁）；`status` 显示模式与暂存条数。写入 `config.json`，重新扫码后仍保留，与设置页「结论模式」同一个值。⚠️ `/f` 是 `/flush` 的别名，**不是** `/final` 的 |
-| `/merge on\|off\|status`（`/mg`） | 打字合并开关：**默认开启**，连续几条微信消息在静默窗口（默认 3 秒）内合并成一轮；`status` 显示窗口/上限/强制放行/当前暂存条数。消息末尾 `..` 表示还要接着说（暂不发出），`!!` 表示立刻提交（开启时两个后缀都会从正文去掉；整条消息只有后缀且没有待合并内容时按普通文本处理）。达到条数上限、`!!`、或强制放行上限（默认 3 分钟，图片/文件到达也会先冲刷）时一定发出；乱序的旧消息**不会**延长窗口。`off` 会先把暂存的消息作为一轮发出去再关闭（那是你自己说的话，不该被开关吞掉）。写入 `config.json`，重新扫码后仍保留，与设置页「打字合并」同一个值 |
-| `/flush`（`/f`） | 立即取回结论模式暂存的最终结论，不必等静默期；没有暂存内容时提示为空 |
-| `/surface on\|off\|status`（`/wxprompt`） | 微信渠道提示词注入开关（默认关）；正文在设置页编辑，不在微信改 |
-| `/notify on\|off\|status`（`/watch`） | 跨会话决策推送总闸（开：任意会话权限/提问卡整卡推送并可直接回复；关：只答当前会话），默认关闭；`/notify tasks on\|off` 单独开关跨会话任务完成/报错提醒（设置页可切换） |
-| `/history [all] [数量]` | 查看最近历史（默认 5 条，最多 20 条；默认只看你和助手，`all` 含压缩检查点/插件注入等系统消息）；当前可回答的提问/权限卡会完整重发（决策推送开启时含其它会话） |
+| `/help`（`/h`、`/?`） | 命令一览，含当前 profile 已注册的 DSH 原生命令 |
+| `/help <命令>` | 该命令的全部例子，如 `/help s`、`/help merge` |
+| `/status` | 工作区、会话、模型、上下文、权限、各开关状态 |
+| `/workspace`（`/ws`） | `list` / `status` / `switch <编号\|路径>` / `add <路径>` |
+| `/session`（`/s`） | `list [current]` / `switch [current]` / `pin` / `unpin` / `new` / `status` |
+| `/preset`（`/p`） | `list` / `switch <名称\|编号>` / `status` — 默认 Preset，与 GUI 同步 |
+| `/model` | `list` / `switch <提供商/模型>` / `status` |
+| `/perm` | `status` / `list` / `switch <名称\|编号>` / `default [名称\|编号]` |
+| `/reasoning` | 查看或切换推理等级 |
+| `/enter`（`/busy`） | 繁忙时 `queue` 排队还是 `steer` 插话 |
+| `/silent`（`/sl`） | 静默模式：每轮只发最终回复 |
+| `/final on\|off\|status`（`/fo`） | 结论模式：整条任务只发一条结论 |
+| `/merge`（`/mg`） | 打字合并开关与状态 |
+| `/media`（`/md`） | 图片/文件合并开关；`at\|path` 切换附件交付措辞 |
+| `/at` | 引用其它会话（`s`）或文件/目录（`f`），附加到下一条消息 |
+| `/notify`（`/watch`） | 跨会话决策推送；`tasks on\|off` 单独控制任务提醒 |
+| `/history` | 查看最近历史，`all` 含系统消息 |
+| `/flush`（`/f`） | 立即取回结论模式暂存的结论 |
+| `/surface`（`/wxprompt`） | 微信渠道提示词注入开关 |
 | `/stop` | 中断当前任务 |
-| `/next` | 继续发送因微信限制被缓存的消息 |
-| `/rq` | 关闭当前会话的待处理卡（提问+权限）；其它会话用 `P1=/rq` |
+| `/next` | 继续发送被微信限流缓存的消息 |
+| `/rq` | 关闭当前会话的待处理卡 |
 
-其他 `/xxx` 命令作为文本转发给 agent；审批/提问卡双端同弹，已在其他端
-处理的卡会提示。
-
-在微信里回答卡片后会收到回执：`✅ 已允许权限卡 P{n}（工具名）。`、
-`⛔ 已拒绝权限卡 P{n}（工具名）。`、`✅ 已回复提问卡 P{n}。`——`P{n}` 就是卡片上印的编号，一次 `P1=1 P2=2` 会各回一条。回执是对你自己刚做的动作的确认，**不受** `/notify` 两个开关与静默模式影响。来自其他会话的卡片在正文里标 `❗来自其他会话`。
-
-所有命令均直接映射 DSH 原生服务（`workspaceRegistry` / `sessionQuery` /
-`agentPresets` / `agentDefaultModel` / `permissionPresets`），默认值与 GUI
-设置页同源同步。
-
-## 架构
-
-```
-微信 (iLink) ── long-poll getupdates ──► dsh-wechat (Cordis host plugin)
-    ▲                                      │
-    │ ◄── sendText/sendMedia ──────────────┤
-    │                                      ▼
-    │                          DSH 进程内服务（零 @deepseek-ai 运行时依赖）
-    │        agents.create/resume ── agent.followup（消息入）
-    │        session/event ── assistant/message、turn/end（消息出）
-    │        approval/request · user-questions/request waterfall ── 审批/提问卡（镜像 GUI，谁先答谁生效）
-    │        tools.register ── send_wechat 工具
-```
-
-> 设计说明：微信端是 GUI 的**第二客户端**，功能不多也不少。
-
-## 设置页（DSH 设置 → WeChat）
-
-客户端半部通过 `dsh.client` + `exports["./client"]` 声明（与 dsh-mcp-manager
-同款交付），挂载到 `settings.section` slot（nav 顺序 40）：
-
-- **状态卡** — 登录阶段（未登录/等待扫码/已扫码，待确认/已登录/登录失败）、Bot ID、
-  监控运行状态、已绑定用户数，与 `跨会话决策推送` / `跨会话任务完成提醒` / `静默` / `结论模式` / `打字合并` 开关同卡展示
-- **扫码** — 未登录时页面内直接显示二维码，扫码确认后自动进入已登录
-- **操作按钮** — `重新扫码`（清除 token 重新登录）、`退出登录`，与保存配置同行
-- **连接配置** — 设置页展示 `cwd` / `cardTimeoutMs` / `sendWechatRateLimitPerMinute` / `allowedUsers` / `mergeSilenceMs` / `mergeMaxMsgs` / `mergeForcedReleaseMs` / `maxOutgoingFileBytes`，以及 `跨会话决策推送` / `跨会话任务完成提醒` / `静默` / `结论模式` / `微信渠道提示词` / `打字合并` / `合并后缀 .. 与 !!` / `允许微信放宽全局默认权限` / `允许 send_wechat 发送任意路径`（开关 + 正文）；保存即生效。`baseUrl` / `cdnBaseUrl` / `botType` / `textChunkLimit` / `finalOnlyIdleMs` / `finalOnlyCeilingMs` 仍可写 `~/.dsh-wechat/config.json` 或插件行 `config:`，设置页保存不会覆盖它们。网关参数变更会自动重启长轮询；存储于 `~/.dsh-wechat/config.json` 与 `state.json`
-- **帮助** — 卡片标题行的 **帮助** 按钮展开本地命令表（与微信 `/help` 同源）；DSH 原生命令仍只在微信 `/help` 末尾按当前 profile 列出
-
-与宿主通信走插件自己的 HTTP API（`/wechat/api/status|help|config|relogin|
-logout`），客户端零 `@deepseek-ai` 依赖。
-
-### Examples
-
-These are the plugin's real entry points; install once, then call one.
-
-#### Detailed example
-
-**Command**
-
-~~~sh
-send_wechat
-~~~
-
-**Input**
-
-~~~json
-{"text":"hello"}
-~~~
-
-**Output**
-
-~~~text
-{"ok":true,"message":"sent 1 message(s)"}
-~~~
-
-*Observed from `tests/send-wechat.test.ts:92-102; src/index.ts:146-193 (tool registration); README.md:87`*
-
-#### Failure branch
-
-**Input**
-
-~~~text
-{"text":"hi"} from an unbound session with no known WeChat user
-~~~
-
-**Output**
-
-~~~text
-{"ok":false,"message":"no WeChat user has interacted yet; a WeChat message must arrive before send_wechat can be used"}
-~~~
-
-*Observed from `plugins/dsh-wechat/src/bridge/bridge.ts:5635; plugins/dsh-wechat/tests/send-wechat.test.ts:179-186`*
-
-#### Brief examples
-
-- `/session`
-- `/preset`
-
-## 配置
-
-优先级：内置默认 ← 插件行 `config:` ← `~/.dsh-wechat/config.json`
-（设置页写入，覆盖前两者）。插件行可带 `config:`：
-
-```yaml
-# 例：追加到 profile 的 cordis.patch.yml
-- id: dsh-wechat
-  config:
-    cwd: 'C:\projects\my-project'
-```
-
-| 键 | 默认值 | 说明 |
-|---|---|---|
-| `baseUrl` | `https://ilinkai.weixin.qq.com` | iLink 网关 |
-| `cdnBaseUrl` | `https://novac2c.cdn.weixin.qq.com/c2c` | 媒体 CDN |
-| `botType` | `"3"` | iLink bot 类型 |
-| `storageDir` | `~/.dsh-wechat` | token/sync-buf/会话映射/临时文件 |
-| `cwd` | `process.cwd()` | 新会话工作目录 |
-| `textChunkLimit` | `4000` | 微信单条消息长度上限 |
-| `cardTimeoutMs` | `1800000` | 提问/权限卡软超时（30 分钟） |
-| `crossSessionNotify` | `false` | 跨会话决策推送总闸（任意会话的权限/提问卡整卡推送，微信直接回复） |
-| `notifyTaskEvents` | `false` | 跨会话任务完成/报错提醒（独立于决策推送，默认关） |
-| `silent` | `false` | 静默模式总闸（只发**每轮**最终回复；重新扫码后仍保留） |
-| `finalOnly` | `false` | 结论模式总闸（跨轮次暂存，整条任务停下后只发**一条**最终结论；优先于 `silent`） |
-| `finalOnlyIdleMs` | `45000` | 结论模式静默期：任一活动事件（助手正文、轮次结束、`agent/status` 空闲/运行）都会把它重新推后 |
-| `finalOnlyCeilingMs` | `600000` | 结论模式硬顶：从第一次暂存起算，到时无论是否仍在续跑都强制交付一次（10 分钟） |
-| `sendWechatRateLimitPerMinute` | `10` | `send_wechat` 工具每分钟推送上限（滑动 60 秒窗口；`0` = 不限）。超限时工具**明确返回失败**并告知模型，而不是继续刷用户 |
-| `allowedUsers` | `[]` | 入站白名单（微信 user id 数组）。**空 = 现有行为**：首个入站者成为绑定对端；非空 = 只有名单内的 id 会被处理，其余在去重/预算/建会话/命令分发之前拦下并记日志，绝不回复。**升级播种**：`config.json` 里从未写过该键、且 `state.json` 已有绑定用户时，启动会把该用户写入这里并持久化（微信里提示一次，`/status` 显示你的 id）；显式存过 `[]` 则永不覆盖 |
-| `allowRemotePermissionEscalation` | `false` | 是否允许微信 `/perm default` 放宽**全局**默认权限。关闭时：解析出的沙箱为 `danger-full-access` 或审批为 `never` 的预设被拒绝并提示到 DSH 设置页操作；不放宽的写入仍允许；会话级 `/perm switch` 不受影响 |
-| `allowAnyFilePath` | `false` | 是否允许 `send_wechat` 发送任意路径的文件。关闭时只允许**调用会话**工作目录或已注册工作区内的文件（`fs.realpath` 归一后比较，`..`/符号链接逃不出去） |
-| `maxOutgoingFileBytes` | `20971520` | `send_wechat` 发送文件的字节上限（20 MiB）。超限在 `stat` 阶段即拒绝，不会读进内存；缓存队列里的文件在冲刷时也会重新校验 |
-| `mergeEnabled` | `true` | **打字合并总闸（默认开启，改变了旧行为）**：连续几条微信消息合并成一轮。`/merge on\|off` 与设置页同款；关闭后每条消息各自一轮 |
-| `mergeSilenceMs` | `3000` | 合并静默窗口（毫秒）：窗口内到达的消息继续追加；`0` = 关闭窗口（等同关闭合并）。乱序更旧的消息不会延长窗口 |
-| `mergeMaxMsgs` | `10` | 单批消息条数硬上限：达到即立刻合并发出（防御性上限，永不超过） |
-| `mergeSuffixTokens` | `true` | 是否识别正文末尾的 `..`（继续追加）与 `!!`（立刻提交）；开启时后缀会从正文中去掉 |
-| `mergeForcedReleaseMs` | `180000` | 强制放行上限（毫秒，3 分钟）：无论窗口、`..` 暂挂、还是上一批仍在投递，到点一定发出——「宁可两句话一轮，也不让通道卡死」 |
-| `surfacePromptEnabled` | `false` | 微信渠道提示词总闸（微信消息驱动时注入，GUI 消息时仍隐藏） |
-| `surfacePrompt` | 见默认中文 | 注入正文（设置页编辑；含 `{{` 会被打散以免打断 DSH interpolate） |
+其它 `/xxx` 作为文本转发给 agent。DSH 原生 slash 命令（`/plan`、`/goal`、`/compact` 等）由 bridge 直接交给原生 handler，微信端无需改动即可识别。
 
 ## 开发
 
 ```bash
 npm install
 npm run build    # tsc → dist/
-npm test         # vitest（splitText/出站 Markdown 过滤/解析/帧处理/waterfall 竞速/状态存储/命令解析/超时恢复/状态颜色/历史截断/渠道提示词/结论模式/打字合并/脱敏/限流与白名单/权限提权闸门/send_wechat 文件边界/白名单播种/审计与文件权限/出站串行槽/有界缓存/dispose 语义/驱动宿主版本区间/DSH >=0.2.1-0 适配）
+npm test         # vitest
 ```
 
-⚠️ **CI 跑在 Linux（`ubuntu-latest`）上，所以 Windows 上"全绿"不等于 CI 绿。** 已经踩过一次：一条断言把 Windows 形状的字面量 `C:\home\.dsh` 同时当输入和期望前缀，而实现会先对该根目录做 `path.resolve`——在 POSIX 上那是**相对路径**，会解析到 cwd 之下，于是 `built.startsWith("C:\home\.dsh/sessions")` 恒为 false，本地 Windows 必绿、CI 必红。
-
-改动测试（尤其涉及路径/权限/文件系统的用例）后，请在 Linux 上再跑一遍完整 CI 步骤：
-
-```bash
-bash scripts/ci-local.sh    # Linux / macOS / Windows 的 WSL 里都可用
-```
-
-它把检出复制到本机临时目录再 `npm ci && tsc --noEmit && vitest run`（与 CI 完全一致），因此不会用 Linux 版的 esbuild/rollup 覆盖你工作副本里的 `node_modules`。
-
-当前版本针对 **DeepSeek Harness `>=0.2.1-0 <0.3.0-0`** 的宿主 API；仓库本身不依赖任何 `@deepseek-ai/dsh-*` 运行时包（`peerDependencies` 里的 `@deepseek-ai/dsh` 是**宿主契约声明**，不是依赖，并已标 `optional` 以免安装时把整个 harness 拖进 profile）。宿主版本要求写了两处、值完全一致：
-
-- `engines.dsh` —— **声明性**。宿主 `evaluatePluginCompatibility` 只校验 `peerDependencies`，**没有任何代码读 `engines`**；真正读它的是插件市场 `dshmarket`（顶层 `engines.dsh` 优先于嵌套 `dsh.engines.dsh`），且固定以 `{ includePrerelease: true }` 求值。
-- `peerDependencies["@deepseek-ai/dsh"]` —— **强制**。不匹配时宿主会**跳过整个 `dsh-wechat` bundle**（`profile.ts` 抛错 → `skippedBundles`，并在每次启动时向 stderr 写一行 `skipping profile bundle`），插件在桌面端表现为消失。
-  - 该 peer 必须同时标 `peerDependenciesMeta.optional`。实测（`pnpm pack` 后 tarball 安装）：不加 `optional` 会**安装失败**（`exit=1`）——peer 被当成真实依赖解析，`@deepseek-ai/dsh` 元包带 82 条 dependencies，会拉进 530 个包并撞上未发布包 `@deepseek-ai/dsh-type-meta` 的 npm 404；即使能解析，lockfile 也会从 28 行膨胀到 8199 行。加 `optional` 后 `exit=0`、lockfile 28 行。宿主门禁**不读** `peerDependenciesMeta`，所以强制力不受影响。
-
-范围只有一段 arm，因为前发布元组枚举并无必要：唯一消费者在 `includePrerelease` 语义下求值，一条 `>=0.2.1-0 <0.3.0-0` 已放行全部 0.2.x 前发布版；而枚举永远补不全（每来一个新的 0.2.x 元组都得再加一条）。上界必须写成 `<0.3.0-0` 而非 `<0.3.0`——后者在 `includePrerelease` 下会放行 `0.3.0-rc.1`。`tests/host-line.test.ts` 用真实 `semver` 把这张准入/拒绝矩阵与两处声明的一致性钉死。
-
-> **与生态另一种写法的对比**：`@anysearch/anysearch-dsh` 不写 `engines.dsh`，而是对**具体子包**声明 `peerDependencies`（`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-web` 等）且大多用 `"*"`，其 `docs/dsh-compatibility.md` 明确说这是「默认放行新 DSH 版本、矩阵只记录已验证版本而非安装白名单」。两者取舍不同：`"*"` 换来「新宿主版本无需改 manifest」，代价是**放弃版本防护**（`*` 连 `99.0.0` 都放行）；本仓选择精确区间，代价是 DSH 大版本升级时要主动更新声明。注意 anysearch 那套用 `"*"` 无法照搬到一个元包 peer 上——`@deepseek-ai/dsh` 是聚合包，解析它就会拉整棵依赖树。
-
-## 已知边界
-
-- `/s list` 与 `/workspace list` 默认各显示 20 行，行末会提示「显示 20/N，看更多: … all（或 … <数量>）」；`all` 不设上限。会话或工作区很多时，回复会按 `textChunkLimit`（4000 字）拆成多条消息，超出微信 10 条/窗口额度的部分进入 `/next` FIFO 缓存（上限 100 条），需在微信端主动发消息或发 `/next` 继续发送。
-- `/s list` 的编号与显示窗口无关：`/s switch <编号>` 仍按**完整**列表校验，所以 `/s list` 之后 `/s switch 25` 能切到未显示的第 25 条（列表行号 1-20 与它一一对应，靠「看更多」提示按需展开）。
-- 会话置顶走宿主注册表（`workspaceRegistry.pinnedSessionIds` / `pinSession` / `unpinSession`），与 GUI 侧边栏共享同一份**持久**集合，任一端置顶或取消，另一端立即一致；`/s pin` / `/s unpin` 只写这一处，不额外落本地状态。置顶区内部仍按最近活动时间降序（对应 GUI 的「最近更新」视图——置顶时间不参与排序），所以置顶只改变分区归属，不冻结行内顺序；无置顶时行序与以前完全一致。归档与置顶互斥：已归档会话无法置顶（GUI 归档时会顺带清掉该会话的置顶），`/s list` 也不显示归档会话，因此只有「当前绑定会话」这条路径可能撞上该限制。宿主未挂载 `workspaceRegistry` 或版本早于该功能时，置顶命令提示「未提供置顶服务」并降级为无置顶显示，不会报错。
-- `list current` 的目录匹配走宿主的 canonical path 规则（`fs.promises.realpath`，与 `@deepseek-ai/dsh-workspace` 的 `realpathNormalize` 同源）：折叠尾斜杠、`.`/`..`、混合分隔符、符号链接，Windows 上也折叠大小写——与 GUI 侧边栏的工作区分组完全一致。目录已删除/无法解析时退化为 `path.resolve` 归一。`/s new` 复用空白会话、`/workspace list` 的「◀ 当前」标记、以及跨会话任务提醒的收件人解析都用同一套比较。
-- 出站文本按官方微信渠道（[Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)）的 `StreamingMarkdownFilter` 处理，而不是一律剥掉 Markdown：`**粗体**`、链接、H1–H4 标题、代码块（```）、行内代码、引用（`>`）、分隔线（`---`）与表格都原样发送；只去掉微信不渲染的部分——图片（`![alt](url)` 整段移除）、H5/H6 标题标记，以及包裹中文的单个 `*`/`_`/`***`/`___` 强调标记（内容保留）。
-- 微信「执行过程」是单条普通文本消息，没有桌面端的折叠交互。内容采用桌面端收起条目的规则：思考首行、中文工具标题与路径/描述，成功输出隐藏、失败仅一行错误、任务清单显示完成计数与变更；长分组标明省略数量，可在 DSH 查看完整记录。过程仅覆盖当前绑定会话，静默时隐藏；**结论模式下直接丢弃**（否则每轮仍会推一条过程消息，正是该模式要消除的洪水）；已推送过程与正文共享发送额度，超限走 `/next`。未推送的过程分组不跨进程重启保存。
-- 结论模式（`finalOnly`）按**任务**而非轮次收敛：暂存的是「这条任务最终那一段正文」，因此**中间轮次的正文与「执行过程」都不会到达微信**，交付时若跨了多轮会在首行标注 `✅ 已完成（共 N 轮）`。它不改变 agent 的行为，只改变推送时机；等待期间随时可发 `/flush` 取回，发下一条需求也会先交付上一件事的结论。微信端用 `/final on|off|status` 开关（与设置页同一个值），`/final off` 会先交付暂存再关闭。硬顶存在的原因是「宁可晚一点，也不能永远沉默」。暂存只在内存里，插件 dispose 会冲刷交付、登出/换绑会丢弃。
-- 秘密脱敏（`maskSecrets`）作用范围刻意只限**错误文本与摘录**：`32+ hex` 与 `40+ base64` 两条规则会误伤 commit SHA、长 id 与长路径，所以绝不用于 agent 的正常回复正文。这是有意的取舍，`tests/redact.test.ts` 用两条断言把这个误伤边界固定下来，而不是假装它不存在。
-- `（i/n）` 分段按**码点**计预算、前缀长度计入预算，代码围栏与 GFM 表格原子不可切；唯一允许超长的例外是「最小合法形式本身就超过预算」的构造（围栏分隔符、或表头+分隔行+首行），此时宁可超长也不产出残缺的 Markdown。
-- `allowedUsers` 为空时是**现有行为**（首个给你发消息的人成为绑定对端），不是「拒绝所有人」——这样老部署升级后不会突然失联；要收紧就填名单，未列出的 id 会在去重/建会话/命令分发之前被拦下并记日志，绝不会得到回复。⚠️ **升级播种会改变这一状态**：`config.json` 里从未配置过该键、而 `state.json` 已有绑定用户时，启动会把该绑定用户写进名单（并在微信里提示一次）——这正是为了堵住「升级后第一个陌生人接管 bot」，但也意味着升级后**其他人**发消息会被忽略；要放开就在设置页清空该字段（显式存过 `[]` 后不会被再次播种）。
-- 打字合并（`mergeEnabled`）**默认开启，属于默认行为变更**：此前每条微信消息各自一轮，现在窗口内的多条会合并成一轮。它对语义的影响是「一轮里可能包含多条用户消息」——需要每条消息单独成轮时发 `/merge off`、把 `mergeSilenceMs` 设为 `0`，或显式用设置页关掉。图片/文件类消息**不参与合并**（先冲刷已输入的文字，再自己作为一轮），因此一次「文字 + 图片」仍会产生两轮；`..` 暂挂的批次仍受条数上限与 3 分钟强制放行约束，不会无限期等下去。
-- 记忆表有界：跨会话完成卡的正文预览（每会话一条，上限 64 个会话）、`/s list` 的最近活动时间（上限 512 个会话）、`/model` 覆盖（上限 128 个会话）、微信消息来源标记（上限 512 条 / 10 分钟 TTL）都是**缓存**——被淘汰只会让该行退回默认显示（创建时间、部署默认模型、按会话 id 显示标题），不会丢失队列里的任何消息。出站队列的内存边界仍是硬上限 400 条（`MAX_OUTBOUND_QUEUE_HARD`），重启后**完整**恢复（此前只恢复最后 100 条，第 101–400 条会被静默丢弃）。
-- 打字合并的缓冲区**不因 slash 命令而提前释放**：`/status`、`/next` 等命令照常立即执行，缓冲的文本仍由静默窗口 / 条数上限 / 强制放行三者之一释放（因此不会丢，只是可能晚几秒）。插件 dispose 会先把缓冲区投递再注销交互；登出 / 重新扫码 / 换绑则**丢弃**（身份变了，别人说的话不该发给下一个绑定者）。
-- `~/.dsh-wechat` 与其下文件（`auth/token.json`、`state.json`、`config.json`、`sync-buf.json`、`audit.jsonl`）以 `0700` / `0600` 创建。⚠️ **Windows 上 Node 忽略 mode 参数**（`chmod` 只能切只读位），实际保护来自 `%USERPROFILE%` 继承的 ACL（仅本人、`SYSTEM`、`Administrators` 可读）——这是依赖继承 ACL，不是本插件自己设的权限。审计文件按 1 MiB 轮转为 `audit.jsonl.1`（只保留一份历史），轮转会记一行日志。
-- 审批/提问卡挂在 Host 的 `approval/request` 与 `user-questions/request`
-  waterfall 上，与 GUI 竞速；无微信 peer 时立即 `next()`，软超时只撤微信卡、不替用户决策。微信先答时会 abort 传给 GUI 的 `request.signal`（不碰 turn 的 `exec.signal`），Web composer 卡随 Gateway `cancel` 帧收起。DSH 重启后未决卡片随 turn 消失（上游已知限制）。
-- 微信回答卡片后的回执**每条占一次微信发送额度**（10 条/窗口）。一次 `P1=1 P2=2` 会发 2 条回执；额度用尽时回执与其他出站消息一样进入 `/next` FIFO 缓存，不会被丢弃。`P{n}` 是整批处理开始时快照的编号（卡片在结算时即被摘除，现算取不到编号、回执会退化成不带编号的文案）。跨会话卡的 `❗来自其他会话` 只是正文提示标记，不影响编号或回复语法。
-- `send_wechat` 工具对所有 agent 可见；任何会话的 agent 都能调用——绑定会话发送到绑定用户，未绑定会话回退到首个已知微信用户（单用户部署默认行为）。
-  单用户模式下，工具推送与 assistant 回复共享唯一一份微信 10 条/窗口限流预算：超限或发送失败自动进入 `/next` FIFO 缓存队列。计数和队列持久化到 `state.json`，普通 DSH 更新或重启后继续沿用；下一条微信入站会重置窗口并自动补发。微信真实限流响应（HTTP 200 + `ret: -2` / `prepare failed`）也会被识别并缓存，不再误判成功。
-- `/preset switch` 遵循 DSH 约束：只有未产生任何内容的会话才能当场
-  `recompose`；已有内容的会话会提示 Preset 应用于下一个新会话。默认
-  Preset 本身写入 DSH 设置文档——按设置服务公布的命名空间写入
-  `agent-preset-registry.selectedDefault`（保留旧版 `agent-presets.default`
-  回退），GUI 设置页与微信双端读写同一事实源；写入被拒绝时明确提示
-  「默认 Preset 切换失败，默认 Preset 未更改」，不再误报成功。
-- 入站重投按微信用户 + 服务端 `message_id`（缺失时用有效 `seq`）去重，缓存保留 30 分钟、最多 4096 条，作用于当前插件实例；重连保留缓存，退出登录/重新扫码清空。无有效身份的消息放行，相同文本但不同身份的消息正常处理。去重缓存不跨进程重启持久化，也不协调同时配置的多个插件实例。
-- 同一用户的会话检查与创建串行执行，避免首次收消息或工作区无绑定时并发创建多个会话。停止/重连会取消正在进行的长轮询，丢弃旧轮询迟到的消息；重连等待旧轮询退出后启动新轮询。
-- iLink 通道是腾讯官方 bot 协议，接口可能随官方调整；跟随 wechat-opencode
-  上游的 `src/weixin/` 修复即可。
+改动代码后需**重启 DSH** 才会生效。架构、配置参考、命令接入细节、已知边界与宿主版本兼容见 **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**。
 
 ## 许可
 
-MIT。`src/weixin/`、`src/adapter/` 移植自
-[wechat-opencode](https://github.com/pan17/wechat-opencode)（MIT，
-原始来源 `@tencent-weixin/openclaw-weixin`），文件头保留出处注释。
+MIT。`src/weixin/`、`src/adapter/` 移植自 [wechat-opencode](https://github.com/pan17/wechat-opencode)（MIT，原始来源 `@tencent-weixin/openclaw-weixin`），文件头保留出处注释。
 
 ## 免责声明
 
-本项目与 DeepSeek Harness、腾讯微信官方**互不隶属**，非官方项目，
-纯属个人学习用途。使用本项目即表示你自行承担由此产生的一切后果。
-
-## PerryLink DSH Plugin Family
-
-This project is part of the DeepSeek Harness plugin family from [PerryLink](https://github.com/PerryLink). The roster stays collapsed below so every README keeps a short first screen; expand it to see every row and its status.
-
-<details>
-<summary>Expand all plugins</summary>
-
-| Plugin | Status |
-|---|---|
-| **[dsh-aqua-input-check](https://github.com/PerryLink/dsh-aqua-input-check)** |  |
-| **[dsh-archive-check](https://github.com/PerryLink/dsh-archive-check)** |  |
-| **[dsh-auto-review](https://github.com/PerryLink/dsh-auto-review)** |  |
-| **[dsh-autotier](https://github.com/PerryLink/dsh-autotier)** |  |
-| **[dsh-bid-ca-precheck](https://github.com/PerryLink/dsh-bid-ca-precheck)** |  |
-| **[dsh-bid-qual-check](https://github.com/PerryLink/dsh-bid-qual-check)** |  |
-| **[dsh-cert-mcp](https://github.com/PerryLink/dsh-cert-mcp)** |  |
-| **[dsh-checkpoint-rewind](https://github.com/PerryLink/dsh-checkpoint-rewind)** |  |
-| **[dsh-click](https://github.com/PerryLink/dsh-click)** |  |
-| **[dsh-composer-history](https://github.com/PerryLink/dsh-composer-history)** |  |
-| **[dsh-contract-stance](https://github.com/PerryLink/dsh-contract-stance)** |  |
-| **[dsh-customs-doc-check](https://github.com/PerryLink/dsh-customs-doc-check)** |  |
-| **[dsh-data-quality](https://github.com/PerryLink/dsh-data-quality)** |  |
-| **[dsh-demurrage-ledger](https://github.com/PerryLink/dsh-demurrage-ledger)** |  |
-| **[dsh-doublecheck](https://github.com/PerryLink/dsh-doublecheck)** |  |
-| **[dsh-drill-script-check](https://github.com/PerryLink/dsh-drill-script-check)** |  |
-| **[dsh-eia-guide-check](https://github.com/PerryLink/dsh-eia-guide-check)** |  |
-| **[dsh-emergency-plan](https://github.com/PerryLink/dsh-emergency-plan)** |  |
-| **[dsh-essay-rubric-check](https://github.com/PerryLink/dsh-essay-rubric-check)** |  |
-| **[dsh-evidence-check](https://github.com/PerryLink/dsh-evidence-check)** |  |
-| **[dsh-export-ctl-check](https://github.com/PerryLink/dsh-export-ctl-check)** |  |
-| **[dsh-fast](https://github.com/PerryLink/dsh-fast)** |  |
-| **[dsh-fmea-table-check](https://github.com/PerryLink/dsh-fmea-table-check)** |  |
-| **[dsh-forecast-penalty](https://github.com/PerryLink/dsh-forecast-penalty)** |  |
-| **[dsh-fund-research](https://github.com/PerryLink/dsh-fund-research)** |  |
-| **[dsh-github](https://github.com/PerryLink/dsh-github)** |  |
-| **[dsh-gongwen-flow-check](https://github.com/PerryLink/dsh-gongwen-flow-check)** |  |
-| **[dsh-gongwen-word-check](https://github.com/PerryLink/dsh-gongwen-word-check)** |  |
-| **[dsh-guard-plan-qc](https://github.com/PerryLink/dsh-guard-plan-qc)** |  |
-| **[dsh-hazchem-check](https://github.com/PerryLink/dsh-hazchem-check)** |  |
-| **[dsh-hazplan-check](https://github.com/PerryLink/dsh-hazplan-check)** |  |
-| **[dsh-hidden-risk-map](https://github.com/PerryLink/dsh-hidden-risk-map)** |  |
-| **[dsh-hs-classify](https://github.com/PerryLink/dsh-hs-classify)** |  |
-| **[dsh-icd-rule-check](https://github.com/PerryLink/dsh-icd-rule-check)** |  |
-| **[dsh-industry-research](https://github.com/PerryLink/dsh-industry-research)** |  |
-| **[dsh-lawcite-adapter](https://github.com/PerryLink/dsh-lawcite-adapter)** |  |
-| **[dsh-laya](https://github.com/PerryLink/dsh-laya)** |  |
-| **[dsh-lc-doc-check](https://github.com/PerryLink/dsh-lc-doc-check)** |  |
-| **[dsh-learning-gap-check](https://github.com/PerryLink/dsh-learning-gap-check)** |  |
-| **[dsh-library](https://github.com/PerryLink/dsh-library)** |  |
-| **[dsh-local-ai](https://github.com/PerryLink/dsh-local-ai)** |  |
-| **[dsh-lsp-actions](https://github.com/PerryLink/dsh-lsp-actions)** |  |
-| **[dsh-mask](https://github.com/PerryLink/dsh-mask)** |  |
-| **[dsh-mcp-panel](https://github.com/PerryLink/dsh-mcp-panel)** |  |
-| **[dsh-medrec-qc](https://github.com/PerryLink/dsh-medrec-qc)** |  |
-| **[dsh-memento](https://github.com/PerryLink/dsh-memento)** |  |
-| **[dsh-nsfc-form-check](https://github.com/PerryLink/dsh-nsfc-form-check)** |  |
-| **[dsh-nurse-record-check](https://github.com/PerryLink/dsh-nurse-record-check)** |  |
-| **[dsh-observe](https://github.com/PerryLink/dsh-observe)** |  |
-| **[dsh-origin-rvc-check](https://github.com/PerryLink/dsh-origin-rvc-check)** |  |
-| **[dsh-ota-review-check](https://github.com/PerryLink/dsh-ota-review-check)** |  |
-| **[dsh-output-styles](https://github.com/PerryLink/dsh-output-styles)** |  |
-| **[dsh-paper-doc-adapter](https://github.com/PerryLink/dsh-paper-doc-adapter)** |  |
-| **[dsh-permission-rules](https://github.com/PerryLink/dsh-permission-rules)** |  |
-| **[dsh-permit-report-check](https://github.com/PerryLink/dsh-permit-report-check)** |  |
-| **[dsh-pipeline-check](https://github.com/PerryLink/dsh-pipeline-check)** |  |
-| **[dsh-pleading-draft](https://github.com/PerryLink/dsh-pleading-draft)** |  |
-| **[dsh-plugin-doctor](https://github.com/PerryLink/dsh-plugin-doctor)** |  |
-| **[dsh-plugin-guide](https://github.com/PerryLink/dsh-plugin-guide)** |  |
-| **[dsh-plugin-kit](https://github.com/PerryLink/dsh-plugin-kit)** |  |
-| **[dsh-plugin-upgrade](https://github.com/PerryLink/dsh-plugin-upgrade)** |  |
-| **[dsh-policy-brief-draft](https://github.com/PerryLink/dsh-policy-brief-draft)** |  |
-| **[dsh-power-loss-split](https://github.com/PerryLink/dsh-power-loss-split)** |  |
-| **[dsh-power-ticket-check](https://github.com/PerryLink/dsh-power-ticket-check)** |  |
-| **[dsh-ppap-check](https://github.com/PerryLink/dsh-ppap-check)** |  |
-| **[dsh-protest-deadline](https://github.com/PerryLink/dsh-protest-deadline)** |  |
-| **[dsh-railway-window](https://github.com/PerryLink/dsh-railway-window)** |  |
-| **[dsh-repair-order-qc](https://github.com/PerryLink/dsh-repair-order-qc)** |  |
-| **[dsh-research-report](https://github.com/PerryLink/dsh-research-report)** |  |
-| **[dsh-review-reply-check](https://github.com/PerryLink/dsh-review-reply-check)** |  |
-| **[dsh-rulefile-check](https://github.com/PerryLink/dsh-rulefile-check)** |  |
-| **[dsh-safety-brief-check](https://github.com/PerryLink/dsh-safety-brief-check)** |  |
-| **[dsh-score](https://github.com/PerryLink/dsh-score)** |  |
-| **[dsh-session-sync](https://github.com/PerryLink/dsh-session-sync)** |  |
-| **[dsh-site-log-check](https://github.com/PerryLink/dsh-site-log-check)** |  |
-| **[dsh-skill-pack-security](https://github.com/PerryLink/dsh-skill-pack-security)** |  |
-| **[dsh-soe-decision-check](https://github.com/PerryLink/dsh-soe-decision-check)** |  |
-| **[dsh-soilwater-check](https://github.com/PerryLink/dsh-soilwater-check)** |  |
-| **[dsh-sop-sync-check](https://github.com/PerryLink/dsh-sop-sync-check)** |  |
-| **[dsh-spc-gbt-adapter](https://github.com/PerryLink/dsh-spc-gbt-adapter)** |  |
-| **[dsh-talk](https://github.com/PerryLink/dsh-talk)** |  |
-| **[dsh-tender-extract](https://github.com/PerryLink/dsh-tender-extract)** |  |
-| **[dsh-tender-matrix](https://github.com/PerryLink/dsh-tender-matrix)** |  |
-| **[dsh-test-drive](https://github.com/PerryLink/dsh-test-drive)** |  |
-| **[dsh-ticktick](https://github.com/PerryLink/dsh-ticktick)** |  |
-| **[dsh-translate](https://github.com/PerryLink/dsh-translate)** |  |
-| **[dsh-warranty-calc](https://github.com/PerryLink/dsh-warranty-calc)** |  |
-| **[dsh-budget](https://github.com/PerryLink/dsh-budget)** | 🧊 FROZEN — see the repo README |
-| **[dsh-claude-move](https://github.com/PerryLink/dsh-claude-move)** | 🧊 FROZEN — see the repo README |
-| **[dsh-defend](https://github.com/PerryLink/dsh-defend)** | 🧊 FROZEN — see the repo README |
-| **[dsh-draw](https://github.com/PerryLink/dsh-draw)** | 🧊 FROZEN — see the repo README |
-| **[dsh-reach](https://github.com/PerryLink/dsh-reach)** | 🧊 FROZEN — see the repo README |
-| **[dsh-background-agents](https://github.com/PerryLink/dsh-background-agents)** | 🚫 RETIRED — see the repo README |
-| **[dsh-session-pin](https://github.com/PerryLink/dsh-session-pin)** | 🚫 RETIRED — see the repo README |
-| **[dsh-team-rooms](https://github.com/PerryLink/dsh-team-rooms)** | 🚫 RETIRED — see the repo README |
-
-</details>
+本项目与 DeepSeek Harness、腾讯微信官方**互不隶属**，非官方项目，纯属个人学习用途。使用本项目即表示你自行承担由此产生的一切后果。

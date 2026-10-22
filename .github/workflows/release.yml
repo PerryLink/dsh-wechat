@@ -1,54 +1,66 @@
 name: Release
 
+# A tag is the ONLY trigger. Everything the release needs is verified here,
+# on the tagged commit itself — the workflow does not poll `ci.yml` and does
+# not depend on CI having run on `main` first.
 on:
   push:
     tags:
       - 'v*'
 
+# Two tags pushed in quick succession must not publish concurrently. The
+# group is per-tag, and an in-flight release is never cancelled midway — a
+# half-published release is worse than a queued one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  # Hard CI gate. When `git push origin main --tags` fires both CI and
-  # Release in parallel, this job polls the CI workflow run for the
-  # tag's commit until it settles on `success`. Both downstream jobs
-  # (`release`, `npm-publish-disabled`) `needs: ci-green`, so a red CI
-  # blocks the GitHub Release creation — it cannot fire alone. Polls up
-  # to ~5 minutes (CI itself runs ~15s, the slack absorbs the
-  # parallel-release runner queue).
-  ci-green:
+  # Build + test on the tagged commit, and refuse a tag that disagrees with
+  # package.json. This runs BEFORE anything is created, so a mismatch costs
+  # nothing to undo: no GitHub Release, no tag surgery.
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Wait for CI on this commit to be green
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Pin Node 22 to match the helper module's zstd API surface; see
+          # .github/workflows/ci.yml for the rationale.
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      # An explicit cache with `restore-keys` rather than setup-node's
+      # `cache: npm`: `npm version` rewrites package-lock.json on every
+      # release, so a strict lockfile key always cold-installed.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Tag must match package.json version
         run: |
-          SHA="$GITHUB_SHA"
-          echo "Checking CI conclusion for $SHA..."
-          for i in $(seq 1 60); do
-            CONCLUSION=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$SHA" \
-              --jq '.workflow_runs[] | select(.name=="CI") | "\(.conclusion)\t\(.status)"' | head -1)
-            case "$CONCLUSION" in
-              "success	completed")
-                echo "CI is green ✓"; exit 0 ;;
-              "failure	completed"|"cancelled	completed"|"timed_out	completed")
-                echo "::error::CI conclusion '$CONCLUSION' — blocking entire release"
-                exit 1 ;;
-              *)
-                echo "Attempt $i/60 — CI status: '${CONCLUSION:-pending}' (sleeping 5s)"
-                sleep 5 ;;
-            esac
-          done
-          echo "::error::Timed out waiting for CI to settle on $SHA"
-          exit 1
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "v$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches package.json ✓"
 
-  # GitHub Release: created only after `ci-green` succeeds. The
-  # changelog query validates the release notes (fail fast if the
-  # version section is missing).
+  # GitHub Release notes come from CHANGELOG.md. `query` fails the job when
+  # the version section is missing, which is the intended outcome: a release
+  # with empty notes is worse than no release.
   release:
-    needs: ci-green
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Extract release notes from CHANGELOG.md
@@ -63,19 +75,16 @@ jobs:
           body: ${{ steps.changelog.outputs.release-notes }}
           draft: false
 
-  # This repository does NOT publish to npm, and cannot: package.json is named
+  # This fork does NOT publish to npm, and cannot: package.json is named
   # `dsh-wechat`, but that bare npm name belongs to the upstream project
-  # (maintainer panpan2026, repository pan17/dsh-wechat) — see the README's
-  # "本仓不发布 npm 包" note. The previous implementation ran
-  # `npm publish` with `secrets.DSH_WECHAT`; every release failed with
-  # `npm error code ENEEDAUTH` (the secret is unset) and would have failed with
-  # 403 even if it were set, because we do not own the name. The job is kept as
-  # an explicit, documented no-op so the tag-triggered release can go green; if
-  # this fork ever ships its own package it must be published under a name we
-  # own (e.g. a `@perrylink/` scope), not the upstream bare name.
+  # (pan17/dsh-wechat) — see the README's "本仓不发布 npm 包" note. This job is
+  # kept as an explicit, documented no-op so the tag-triggered release can go
+  # green; if this fork ever ships its own package it must be published under a
+  # name we own (e.g. a `@perrylink/` scope), not the upstream bare name.
   npm-publish-disabled:
-    needs: ci-green
+    needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Explain why no npm publish happens
         run: |

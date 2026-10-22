@@ -81,11 +81,135 @@
 
 - The tag-triggered release workflow could never succeed: its `publish-npm` job ran `npm publish` with `secrets.DSH_WECHAT`, which is unset, so every release failed with `npm error code ENEEDAUTH` (the two 2026-09-09 runs both failed). It would have failed with a 403 even with a token, because `package.json` is named `dsh-wechat` and that bare npm name belongs to the upstream project (maintainer `panpan2026`, repository `pan17/dsh-wechat`) — the README already states this repository does not publish to npm. The job is now an explicit, documented no-op (`npm-publish-disabled`) so releases can go green; a future package must use a name this project owns.
 
+## [0.13.3] - 2026-10-22
+
+### Fixed
+
+- **设置页每个字段的 `?` 悬浮时不再出现两遍提示。** `HelpTip` 同时设了 `title` 和 portal 到 `body` 的 `wx_help_float` 气泡，鼠标一放上去，浏览器自带的原生提示（贴着光标）和自定义气泡（贴在下方）一起弹出、互相压住，同一句话读两遍还看不清。现在去掉 `title`，只留自定义气泡；可访问名仍由 `aria-label` 提供，读屏行为不变。`tests/help-catalog.test.ts` 新增一条断言钉住 `?` 上不再出现 `title`。
+
+### Changed
+
+- **`重新扫码` / `退出登录` 旁的说明改成安装提示**：原「重新扫码会清除本地 token；退出后需重新扫码」→「新安装或者更新本插件后，建议重启DSH再使用」。前者在按钮已经写明动作之后又复述一遍，后者回答的是用户真正会问的问题——更新完要不要重启。
+
+## [0.13.2] - 2026-10-21
+
+### Fixed
+
+- **裸 `/model`、`/s`、`/ws`、`/p`、`/perm` 不再回「⚠️ 未知命令 /model，已作为文本转发给 agent」。** 这些名字就印在 `/help` 一览里，回「未知命令」等于当场否认自己刚说的话，而且还会把命令当聊天发给模型。根因是五个 parser 只匹配「子命令 + 参数」的形状，裸形式返回 `null`，于是掉进未知命令分支。现在它们与 `/reasoning` `/enter` `/notify` `/surface` 对齐，裸形式一律报状态。
+- **已文档化命令的参数写错，回该条的 `usage` 行而不是「未知命令」。** `/model foo` 里的 `/model` 不是未知命令，只是参数不对——新增 `commandUsageHint()`，按 catalog 的 `usage` 回答。真未知的名字（`/nope`）仍然走原来的未知命令提示与转发，行为不变。
+- **`/help` 后面的一切都当命令名，解析不到也不转发。** 之前 `/help fuck` 回「⚠️ 未知命令 /help」，`/help me write a test` 甚至被当成聊天发给模型——用户明摆着在求助，这两种都是答错。现在 `/help fuck`、`/help nope`、`/help me`、乃至整句 `/help me write a test` 一律回 `⚠️ 没有 /xxx 这条命令，下面是全部命令：` + 完整一览，**不转发给 agent**。理由：`/help` 是「查帮助」这个动词，以它开头的行不是聊天；`man` 对不存在的页也是报错 + 自己的用法，不是把词忽略掉。`detectUnknownSlashCommand` 同步跳过所有本地命令名，所以任何已文档化的名字都不会再被叫「未知命令」。
+- 新增 17 条测试（`tests/help-topic.test.ts` 的「a documented command never answers 未知命令」一组）：15 个裸命令逐一断言不回「未知命令」且不转发给 agent、`/model foo` 回用法、`/nope` 仍然报未知；外加 `/help nope` / `/help fuck` / `/help me write a test` 都回「没有这条命令」+ 一览且不转发。
+- 设置页「指令帮助」里的 `/help` 条目同步补上 `/help <命令>`：说明改成「查看指令清单与示例」，示例加了 `/help s`（该命令的全部例子）与 `/help merge`（写全名也一样），不再只是三个等价的裸别名。
+
+### Changed
+
+- **微信 `/help` 改成两级：一览 + 按需看例子，等宽表格排版。** 之前 `/help` 是一张 26 行 1523 字的语法表（`list | switch <路径|编号>`），全是占位符，不认识 workspace / preset 的人读不下去。现在：
+  - **`/help` 只出一览**（44 行 / 1514 字）：代码块里每条命令一行 `/命令 (简写)  说明`，多子命令的命令下一行列出**全部**子命令（`/s list`、`/s list current`、`/s switch`、`/s switch current`、`/s pin`…）。扫一眼就知道有哪些命令、各自能干什么。`list current` / `switch current` 是 `/session` 的独立形式（只看当前项目的会话），过去在 `subcommands` 里被 `list` / `switch` 吞掉，一览里根本没有它们——现在单独列出。
+  - **`/help <命令名或简写>` 出该条的例子块**：`/help s` 与 `/help session` 输出完全相同，内容是 `/session` 的 11 条示例，每条一行 `/s list  最近 20 个会话（📌 为置顶）`。95 条示例一条不少，命令集合与设置页「指令帮助」同源（同一个 `src/help-catalog.ts` 渲染）。
+  - **一套措辞，简单但不口语**：`summary` / `note` 是面板与微信共用的唯一文案。原来的写法偏口语（「别憋了，现在就把暂存的结论发给我」「换脑子、调想多深、定它能动你哪些文件」），在面板里显得随意、在等宽表格里更读不下去。全部改写成说清「做什么」的中性短句（「立即发送暂存的结论」「选择模型、设置推理等级、设定可读写的文件范围」），`summary` ≤ 40 字、`note` ≤ 30 字。历史上曾为微信单独加过 `terse` 字段，随后合并回一套——维护两份同义文案只会漂移。
+  - **表格放进代码块**：微信气泡不会横向滚动，长行只能折行，而折行会落在反引号中间，把一条可复制的命令劈成两半（`…（编号看 /` + `s list）`）。代码块是客户端那个**可横向滑动**的等宽框，所以表格整体包在 ``` 里，并按显示宽度对齐（中文算 2 列）。
+  - **文案不再手写**：`formatHelp()` / 新增的 `helpTopicBlock()` 都从 `helpCatalog()` 生成，微信端与设置页改一处两边同时变。
+  - **别名只留简写**：`s` / `ws` / `p` / `sl` / `fo` / `f` / `mg` / `md` / `h` / `?` 保留；`permission` / `busy` / `watch` / `notice` / `wxprompt` 从帮助里去掉（parser 照常接受，只是不再显示——`/notify (watch, notice)` 会被读成三条命令）。子命令行也统一用简写。
+  - **`/help <命令>` 只认已文档化的命令**，但解析不到时仍然是帮助请求：`/help nope`、`/help fuck`、乃至整句 `/help me write a test` 都回「没有 /xxx 这条命令」+ 完整一览，不转发（详见 `### Fixed`）。bare 命令（`/s`、`/silent`、`/merge`…）语义**完全不变**，展开例子只有 `/help <命令>` 一个入口。
+  - `tests/help-catalog.test.ts`（36 条）、`tests/help-topic.test.ts`（27 条）守住：一览含全部子命令（含 `list current` / `switch current`）、别名必须比命令名短且不是另一条命令的全名、每条示例与其说明都出现在对应例子块里、代码围栏成对（折行问题不会悄悄回来）、`summary` ≤40 字 / `note` ≤30 字、已文档化的名字永远不回「未知命令」、`/s list` 与 `/silent` 不被劫持、一览 ≤2000 字 / 块 ≤550 字、Markdown 过过滤器不变形。
+
+- **设置页「指令帮助」改成独立的说明书，不再是 `formatHelp()` 原文。** 此前点开它渲染的是微信 `/help` 那份语法表（`list | switch <路径|编号>`），21 条命令挤在一块等宽文本里，不认识 workspace / preset 的人读不下去。现在：
+  - 新增 `src/help-catalog.ts` 作为**用户向文案的单一来源**：21 条指令各一句简短说明 + **95 条能直接照抄的示例**（每个子命令至少一条——`/session` 从 3 条补到 11 条，`/at` 7 条，`/workspace` 6 条），按 6 个用途分组。经 `/wechat/api/help` 的 `catalog` 字段下发；同一响应的 `text` 现在也是这份文案渲染的一览（见上一条），微信端与设置页同源。
+  - 面板：顶部一句说明 → 搜索框（按指令名 / 别名 / 说明 / 示例内容过滤）+ 全部展开/收起 → 分组列表 → 页脚。每条命令一行，行尾 **?** 悬浮出前 2 条示例并提示「共 N 条示例，展开查看全部」；点整行或直接点 ? 展开**全部**示例（手机上没有 hover，点必须也能用）；每条示例点击即复制，显示「已复制」。展开状态记在 `dsh-wechat/help-open`，重开页面还在。
+  - 老宿主（响应里没有 `catalog`）自动退回原来的纯文本面板；请求失败显示原因 + **重试**，不再是一片空白。
+  - 顺手把设置页 21 条字段 **?** 与 6 段分组说明也改写（先说会发生什么，再说默认值），技术标识符仍留在右侧 `code` 里。
+  - 修掉一个被新测试挖出来的旧 bug：`/h` 一直是 `/help` 的文档化别名，却不在 `LOCAL_COMMAND_NAMES` 里——`tryNativeCommand` 先于本地分支执行，宿主若注册了同名 `h` 命令会把它悄悄抢走。
+  - `tests/help-catalog.test.ts`（现在 36 条）守住四件事：与 `/help` 的命令集合完全一致（漏写一边就红）、每个子命令都有示例、每条 `command` 示例都能被 bridge 真正识别、文案不含术语与 `<…>` 占位符。
+
+## [0.13.1] - 2026-10-20
+
+### Changed
+
+- **附件交付默认改成纯路径，「以 @引用 方式交给 AI」改为默认关闭。** 0.13.0 把这个开关默认打开了，理由是 chip 更好看；但 `@路径` 只有在宿主挂载了 `dsh-file-reference` 时才被解析成可点开的引用，没挂载时气泡里就是一行裸 `@C:/…`——比路径难读，还容易让人以为坏了。路径写法在任何宿主上都能正常阅读，所以默认回到路径，chip 变成显式选择（`/media at` 或设置页「图片与文件 → 以 @引用 方式交给 AI」）。两种措辞交给模型的都只是指针，文件内容仍然永不内联。已经保存过该键的 `config.json` 不会被改动：显式存着 `true` 的继续用 `@引用`。
+
+## [0.13.0] - 2026-10-20
+
+### Added
+
+- **`/at` —— 微信端的 `@会话` / `@文件` 引用。** GUI 输入框里打 `@` 会弹补全、选中后插入一个原子引用 chip；微信没有输入框，这个能力此前**完全缺失**：想在微信里让 agent 看看「另一个会话聊了什么」或「某个文件写了什么」，只能手工把会话 id 或路径贴进正文，而会话 id 贴进正文对模型毫无意义（模型看到的是 `session-xxxx`，不是那段对话）。现在 `/at` 补上这条链路，走的仍是宿主自己的引用管线：
+  - `/at s <编号|关键词>` —— 引用**其它会话**。编号与 `/s list` / `/s switch` 完全同源（优先复用最近一次列表快照，否则全量列表）；关键词优先交给宿主自己的 `listCandidates`（按工作目录亲缘排序、标题只读投影，不折日志），没有 live agent 时退回按 title / cwd / id 扫 `/s list` 行，两条路径的匹配字段集刻意一致。多命中时列出候选让人指定而不是猜。登记后下一条消息带宿主规范的 `@[标题](dsh-session:<base64url>)`，`@deepseek-ai/dsh-session-reference` 在 `agent/pre-step` 把它改写成可读的 `@标题` 并紧随一条 `## Referenced sessions` 快照——与 GUI 的 `@会话` 是**同一条链路**，不是复制品。
+  - `/at f <路径>` —— 引用**文件或目录**。相对路径从当前工作区解析，也接受绝对路径（工作区之外同样可用：`@文件` 是给模型的指针，不是 bridge 自己去读，宿主 `FILE_REFERENCE_PROMPT` 明确写了「绝对路径指代宿主机上的文件或目录」）；目录自动带尾斜杠，含空格的路径自动写成 `@"a b.txt"`（也可直接 `/at f "a b.txt"`）。模型看到的是 `@路径` 文本，`dsh-file-reference-local` 的提示词负责让它调用 `read` 而不是假装读过。路径两端的不可见格式字符会被剥掉（从资源管理器复制常带 U+202A，而 `trim()` 不处理它们，一个前导 U+202A 就足以让 `path.isAbsolute()` 返回 false，把 `C:\…` 当成相对路径解析）；中文输入法的弯引号 `“…”` 与 ASCII `"…"` 同样接受。
+  - `/at` 查看暂存（编号列表 + 上限）、`/at rm <编号>` 移除、`/at clear` 清空；`/status` 在**有暂存时**多一行「引用暂存」，没有则一行不加。
+  - **暂存式而非立即发送**：命令只登记，引用落在**下一条**投递给 agent 的消息上（打字合并开启时落在合并后的那一批），投递成功即清空。这样路径里的空格、正文从哪开始都不需要额外分隔符，也不会出现「引用发出去、正文还没想好」。引用块**跟在正文之后**：宿主 `dsh-session-title` 用首条用户消息的**开头**生成会话标题（确定性 fallback 取前几个词），前置的 `@[标题](dsh-session:InNlc3N…)` 会把新会话标题写成 base64；而宿主的 mention 解析与位置无关，放后面不影响展开。引用块还**以换行开头**（`MENTION_BLOCK_BREAK`）——不是排版偏好，是 GUI 拼接块的方式决定的硬需求，见 `### Fixed` 的「`@文件` 在 GUI 里点不开」条目。
+  - **可预见的失败全部挡在 `/at` 阶段**，因为宿主的引用失败是**整轮终止**：引用自己（`SESSION_REFERENCE_SELF_REFERENCE`）、第 4 个会话（`SESSION_REFERENCE_TOO_MANY`，上限与宿主 `MAX_REFERENCES = 3` 对齐）、宿主未挂载 `dsh-session-reference`（mention 会被当普通文本转发，模型只看到 base64 串）——三种情况都在登记时拒绝并说明原因，代价是一条回复而不是用户整段 prompt。路径含引号/控制字符的路径同样当场拒绝；找不到路径时给出相近候选（优先用 `ctx.fileReferences`，没有 live agent 时退回目录列举）。
+  - 暂存只在内存里，**不写 `state.json`**：一条引用是「这一次」的意图，重启后大概率已不是同一件事；另有 10 分钟 TTL，登出 / 重新扫码 / 换绑整表清空（引用属于上一个对端）。agent 创建/恢复失败时**不清空**，重发正文即可，不必重新 `/at`。
+  - 接线与既有本地命令一致：`parseAtCommand` / `isAtCommandAttempt`、卡片 bypass（有待处理卡时 `/at` 照常执行，且参数写错也是回用法而不是被当成卡片答案）、`LOCAL_COMMAND_NAMES` 去重（同名原生命令抢不走）、`/help` 与设置页「指令帮助」同源。
+- **`src/bridge/at-refs.ts`** —— mention 渲染层（纯函数，零依赖）：`encodeSessionReferenceUri` / `formatSessionMention` / `formatFileMention` / `buildMentionBlock` / `normalizeAtTarget` / `hasInvisibleMarks`。与宿主 `dsh-session-reference` 的 URI 编解码、`dsh-file-reference` 的 grammar 逐字对齐；唯一有意的差异是目录**闭合引号**（宿主在补全过程中输出未闭合的 `@"dir/` 以保持菜单下钻，微信没有菜单，发出去的是成品文本）。
+
+- **图片/文件与文字合并发送（`mediaMergeEnabled`，默认关闭）；附件交付措辞可选 `@文件` 引用 / 纯路径，但两者都只给指针，不再内联内容。** 此前微信端的图片/文件**永远是自己一轮**：它到达时会先把打字合并缓冲里的文字冲刷成一轮，再自己作为一轮进 agent，于是「截图 + 这个问题怎么看」要烧掉两轮，而 agent 在那一轮里只看得到图、看不到问题——回答的往往是它自己猜的意图。设置页新增第 6 组「图片与文件」：
+  - **合并（`mediaMergeEnabled` / `mediaHoldMs`）** —— 开启后，**不带文字说明**的图片/文件/视频先暂存，用户随后发来的**那一条文字**到达时，两者合成**一条 prompt、一轮对话**交给 agent（文字在前、附件在后）。设计要点：
+    - **文字必须在首块**。宿主 `dsh-session-title` 用首条用户消息里**所有** text 块拼标题（确定性 fallback 取开头几个词），若把 `[收到图片] @C:/…`（或 path 模式的 `[收到图片] 文件已保存到: C:/…`）放在前面，新会话标题就变成那个路径——与 `/at` 把 mention 追加在正文之后是同一个理由。
+    - **下载推迟到真正投递时**。暂存只记 `WeixinMessage`，flush 时才解密落盘：登出 / 重新扫码 / 换绑（`dropMergedText`）丢弃暂存时，既不产生临时文件，也不为没人接收的附件花一次 CDN 请求。
+    - **等待一定结束**。`mediaHoldMs`（默认 3 分钟，与 `mergeForcedReleaseMs` 同长）到点就把已暂存的附件单独发出（一张没人提问的图也值得回答），且**实际等待取它与 `mergeForcedReleaseMs` 中更短者**——合并窗口的活性上限永远罩住它；另有 `mergeMaxMsgs` 条数上限与 `inFlight` 保序（上限同为强制放行）。
+    - **只暂存「没有话」的媒体**：同一条消息自带文字说明时立即发送（它已经说明意图，再等只是加延迟）；语音（无转写）不参与；没有可下载引用的媒体不参与（暂存它只可能产出「下载失败」）。
+    - **关闭时逐字回退**：`mediaMergeEnabled=false` 仍是原来的「先冲刷文字、媒体单独一轮」，与 0.12 完全一致——所以默认关闭。
+    - 关闭路径不吞东西：`/media off` 与设置页关闭该开关都会**先发出**已暂存的附件再关闭（那是用户自己发的图）。
+  - **交付措辞（`mediaAtRefEnabled`，默认关闭 = 纯路径）** —— 附件存到本机后只把**指针**交给模型，措辞有两种：`path`（默认）是「文件已保存到: 路径」的单行纯文本（不再附加「你可以使用这个路径来读取或处理文件」——那是 `FILE_REFERENCE_PROMPT` 已经在说的事，放在微信气泡里只是噪音）；`@引用` 需显式开启，复用 `at-refs.ts` 的 `formatFileMention`（与 `dsh-file-reference` grammar 逐字对齐；Windows 反斜杠转 `/`，含空格写成 `@"…"`），由 `dsh-file-reference-local` 的 `FILE_REFERENCE_PROMPT` 要求模型自己调 `read`，在 GUI 里就是一个可点开的 chip。默认关闭是因为 chip 依赖宿主挂载文件引用插件，没挂载时气泡里只剩一行裸 `@C:/…`，而路径在任何宿主上都能正常阅读。这是**措辞**开关，不是内容开关——两者交给模型的字节数都是 0。
+
+    0.12 给文本文件（`.txt/.md/.csv/.log/…`，按扩展名白名单）额外附上整段内容，理由是「省一次 tool call」。这个理由站不住：`@文件` 是指针，不是内容搬运——同一次对话里内容会**出现两遍**（气泡里一遍、`read` 结果一遍），GUI 里就是一个几百行的气泡；而那段内联**没有任何大小上限**（`buffer.toString("utf-8")` 直接吃整个 buffer），一个 4 MB 的日志会被整段塞进 prompt，要么超出上下文窗口直接失败，要么把预算全烧在模型未必需要的字节上。0.13.0 因此**删掉这条路径**：`convertMediaItem` 的文件分支只剩 `[收到文件: name] <指针>`，`isTextFile` / 内联代码 / 那个 32 KB 预算一起移除，**任何配置都无法把文件内容请回来**。图片与视频同样只给指针（`[收到图片] @<path>`、`[收到视频] @<path>`），路径含引号/控制字符时退回普通路径写法，绝不产出会被截断成散文的 mention。
+  - **接线**：`/media on|off|at|path`（别名 `/md`），与 `/merge` 同款——parser、dispatcher、卡片 bypass、`LOCAL_COMMAND_NAMES` 去重、`/help`、`config.json` 持久化、`/status` 新增「图片/文件合并」行（含暂存个数与当前交付措辞）、设置页同一份值。
+  - **内部**：`MergeState.entries` 从 `string[]` 改为有序 `MergeEntry[]`（`text` / `media`），flush 不再构造合成的 `WeixinMessage`；`forwardToAgent` 拆成 `promptBlocksFor`（单消息 → blocks）+ `forwardBlocksToAgent`（agent ensure / `/at` mention / 来源标记 / 繁忙投递），批次与单消息共用同一条投递路径。`isHoldableMediaItem` 定义「可暂存媒体」，`findMediaItem` 改为导出。
+
+### Changed
+
+- **微信收到的文本文件不再把内容内联进消息（与 0.12 不兼容；内容内联不可恢复，措辞开关保留）。** 0.12 的措辞是「路径 + 全文」，0.13.0 只给指针：`@文件` 是交给模型的引用，宿主 `FILE_REFERENCE_PROMPT` 会让它自己 `read`，因此内容不需要、也不应该出现在 user message 里。删掉的是**内联那条路径**（`isTextFile`、`buffer.toString("utf-8")`、无上限的整段拼接），不是「以什么形式发送」的开关：`mediaAtRefEnabled` 仍然在（默认关闭 = 纯路径），`/media at|path` 与设置页复选框照旧可用，只是取值从「要不要给内容」变成了「给 `@引用` 还是给纯路径」——两个取值交给模型的都只是指针。升级后行为变化：GUI 气泡里不再出现文件正文，只留一行路径（开了 `@引用` 则是一个可点开的 chip）；模型需要内容时会自己读。另一个顺带修好的坑：`ConfigStore.load()` 现在会丢掉本版本不认识的键，删掉的开关不会永远躺在 `config.json` 里冒充有效配置（那个文件是用户唯一能读到生效配置的地方）。
+- **README 精简，维护者内容迁移到 `docs/DEVELOPMENT.md`（并新增 `AGENTS.md`）。** 原来的 README 有 340 行、5 万字符，架构图、24 行配置表、命令实现细节、20 条已知边界、宿主版本兼容全挤在里面，想装插件的人得先翻过一张配置表和十几条设计取舍。现在 README 只保留七节——介绍 / 功能 / 安装 / 微信命令 / 开发 / 许可 / 免责声明——功能压成一段话、命令表一行一句，共 74 行；架构、设置页实现、配置参考（每个键的默认值与边界）、命令接入方式（`ctx.commands` 原生同步、各命令实现要点、`/at` 的实现约束）、已知边界与宿主版本兼容全部搬到 `docs/DEVELOPMENT.md`。`PUBLISH.md` 的发布前检查拆成两份清单（README 管用户可见变化，DEVELOPMENT 管配置键与实现细节），并新增 `AGENTS.md` 记下这条约定：README 保持简洁通俗易懂。
+
+### Fixed
+
+- **`/at f` 的 `@文件` 在 GUI 里不是 chip、点不开（「看起来没正常@文件，像是发了个 @ + 纯文本」）。** 症状只在 GUI 渲染层：微信侧 `/at f` 登记成功、模型也拿到了可解析的 `@路径`，但气泡里是纯文本 `…而已@"C:/…"`，没有 `@文件` chip、没有链接；同一会话里**微信上传附件**的 `@路径` 却一直是正常 chip。根因是**块边界被拼接抹掉**，不是 token 拼写：GUI 把一条用户消息的**所有** text 块用**空串**连起来再交给 mention 语法（`dsh-client-ui-chat` 的 `contentParts` → `texts.join("")`），而 `@文件` 规则要求 `@` 前面是空白（`dsh-client-ui-reference` 的 `(?<!\S)`，宿主 `@deepseek-ai/dsh-file-reference` 同为 `(?:^|\s)`）。`/at` 的 mention 块**以 token 开头**，边界于是取决于正文最后一个字符——2026-10-20 14:08 的会话日志 `session-f184ce0c` 里，`没事，我测试@功能而已` + `@"C:/Users/83976/Desktop/test - 副本.txt"` 被拼成 `…而已@"C:/…"`，`@` 前是「已」，规则不匹配 → 纯文本；两分钟后那条上传消息 `[收到文件: test - 副本.txt] @C:/…` 之所以正常，是因为空白在**它自己的块里**。会话引用没有这个约束（`session` 规则用 `text.indexOf("@")`，不看空白），所以「`@会话` 一直好的、`@文件` 时灵时不灵」这个只在文件上出现的偏斜，正好是这个 bug 的指纹。
+  - 修复：`buildMentionBlock` 返回的文本**以换行开头**（`MENTION_BLOCK_BREAK`），让空白边界成为 token 自身的属性，不再依赖相邻块的末字符；换行比空格更可读（引用自成一行），且 `trimWhitespaceRule` / `collapseWhitespaceRule`（order 1000/1010）都排在 file 规则（order 30）之后，按原串扫描时左邻空白仍在，两条规则吃不掉它。
+  - 回归测试不只是断言字符串：`tests/at-command.test.ts` 里新增两例——一例把 `buildMentionBlock` 的输出与「以非空白结尾的正文」按 GUI 的方式 `join("")` 后用 **GUI 自己那份语法**（`/(?<!\S)(@"[^"\n]+"|@[^\s]+)/gu`，从 `dsh-client-ui-reference` 逐字取出）匹配，断言恰好命中两个 token，并对**修复前**的拼法断言命中 0 个；另一例从 `handleMessage` 走完整条链路（`/at f "my dir/a.txt"` → 正文），对 `received[0].content` 做同样的拼接与匹配。
+  - 只影响新消息：已落盘的坏气泡是历史文本，无法回改（重发一条即可）。上游值得单独报一次：mention 解析默默依赖「块间有空白」，而 GUI 的拼接分隔符是空串——任何以 `@` 开头的块都会踩到，不只 `/at`。
+- **模型切换与 GUI 不同步（DSH 0.2.1 的 per-session 模型选择）。** 旧实现把 `/model switch` 存成 bridge 内存里的 `modelOverrides`、在 `agent/request` 里覆盖最终请求，并在 `agentSetup` 里冻结会话开始时的模型快照。DSH 0.2.1 把选择改成 Host 所有：GUI 的 `session.selectModel` 追加 `model/selection`、投影为 `modelSelection.next`，`sessionController` 据此安装下一步的 selection。两套状态因此各写各的——2026-10-20 的会话日志就是证据：03:26 GUI 已切到 `opencode-zen/deepseek-v4.1-flash-free`（两条 `model/selection`），03:28 的微信请求头仍是旧的 `auto/deepseek-v4.1-flash`（冻结快照赢）；03:31 微信 `/model switch workbuddy-ai/...` 只改了内存覆盖与默认，03:32 请求头生效但日志里**没有**对应的 `model/selection`，GUI 模型选择器自然看不到。
+  - `/model switch`、`/reasoning switch`、`/reasoning default` 现在优先调用 `ctx.sessionController.selectModel({sessionId, provider, model, reasoningEffort?})`——与 GUI 模型选择器完全同一条 Remote：校验路由、写入 durable `model/selection`、安装下一步 selection、后台保存默认。成功后清掉该会话遗留的 `modelOverrides`；只有未挂载 `sessionController` 的旧宿主才回退到原来的内存覆盖 + `saveDefaultModel`。Host 拒绝（如 `session/model-unavailable`）时直接回复失败原因，不再静默 fallback 成「微信能用、GUI 看不到」的第二套状态。
+  - `agentSetup` 在 `sessionController` 存在时改为**实时读取** `modelSelection` 投影（`next ?? lastUsed` → request header → 默认），并在 `system-prompt/assemble` 处快照、同一 step 的 `agent/request` 复用该快照——与宿主 `installModelSelection` 的 mid-step 语义一致，避免「提示词写 A、请求发 B」。没有 controller 的旧宿主保留冻结路径，全局覆盖仍然生效。
+  - `resolveEffectiveModel`（`/status`、`/model status`、`/reasoning status`）同样优先读 `modelSelection` 投影；GUI 一切换，微信 `/status` 立即显示新模型，不必等下一轮请求头更新。
+
+### Tests
+
+- 新增 `tests/model-sync.test.ts`（6 例）：`modelSelection` 投影解析（`next` 优先 / `lastUsed` 回退 / 坏值忽略）、`agentSetup` 在投影变化后下一 step 使用新模型、mid-step 切换不拆分提示词与请求路由、投影缺失时回退 request header、`{{model}}` 变量跟随实时选择。
+- `tests/model-reasoning.test.ts` 新增 4 例：`/model switch` 与 `/reasoning switch` 走 `sessionController.selectModel` 且不写 `modelOverrides`、Host 拒绝时明确报错且不落默认、`resolveEffectiveModel` 在请求头过期时优先采用 `modelSelection.next`（现共 17 例）。
+
+- 新增 `tests/at-command.test.ts`（57 例）：解析矩阵（`list`/`clear`/`rm`/`s`/`f`、缺参数、非法子命令）、与 18 个既有 parser 的别名冲突守卫、mention 语法往返（中文 / `[]` / 反斜杠 label、`@path` / `@"a b.txt"` / 目录尾斜杠 / 控制字符拒绝）、登记与一次性注入（含「第二条消息不再带 mention」、正文保持在首块以免污染会话标题）、打字合并批次只带一次 mention、关键词解析的两条路径（宿主 `listCandidates` 与无 live agent 时的本地行扫描）与歧义提示、全部拒绝路径（引用自己 / 第 4 个会话 / 第 9 个文件 / 服务缺失 / 找不到路径的候选提示）、工作区**之外**的绝对路径引用（含带 U+202A 的粘贴路径回归）、`/at rm` 与 `/at clear`、TTL 过期与「过期后重新登记是全新一组」、登出清空、`/status` 有/无暂存两态、以及有待处理权限卡时 `/at` 不被吞；另有两例专盯 **GUI 块拼接后的空白边界**（正文以非空白结尾时 `@文件` 仍成 chip，含单元级与走完整 `handleMessage` 链路各一例，匹配用的是 `dsh-client-ui-reference` 的原样语法）。
+- 新增 `tests/media-merge.test.ts`（30 例）：图 → 文合成**一轮**且文字在首块、下载只发生在 flush 时、两图 + 一文（两个附件块）、文件同样合并、自带文字说明的图立即发送、语音不暂存、关闭时逐字回退为两轮、等待窗口到点单独发出（fake timers）、`mergeMaxMsgs` 上限、`mediaHoldMs` 被 `mergeForcedReleaseMs` 夹住、下载失败退化为「下载失败」文字且不丢批次、dispose 冲刷暂存、logout 丢弃且**不下载、不留临时文件**、附件交付的五条硬断言（`@` 模式默认且图片只出 `@`、`path` 模式是「文件已保存到:」且无 `@`、文本文件内容在**两种措辞下**都不出现、1 MiB 的 `.log` 两种模式下都不进 prompt、二进制同样只给指针——都同时断言**旧措辞与「文件内容」字样不再出现**）、`/media` 解析矩阵（`on` / `off` / `at` / `path` / `status`）与 19 个既有 parser 的别名冲突守卫、卡片 bypass / `LOCAL_COMMAND_NAMES` / `/help`、`/media on|off|at|path` 落盘并生效、`/media off` 与设置页关闭都先冲刷、`/status` 两态（含当前交付措辞）、以及与打字合并共存的两种组合（开：`文 → 图 → 文` 一轮；关：图仍先冲刷文字）。
+- `tests/client-panel-wiring.test.ts`：`RENDERED_TOGGLES` 加 `mediaMergeEnabled` 与 `mediaAtRefEnabled`、数值字段加 `mediaHoldMs`、`GROUPS` 加 `media`、merge 切片终点改到 `id: "media"`，并新增「图片与文件的两组开关与参数同组、且不泄漏到前一组」「只有附件等待被置灰，交付措辞始终可点」两条守卫（现共 69 例）。
+- `tests/config-store.test.ts` 新增 3 例：`mediaAtRefEnabled` 默认 `false`（纯路径）且与两个合并键同款做类型守卫、手写 `config.json` 里的坏值被丢弃后回落默认、本版本不认识的键在加载时被丢掉且下一次写入后不复现。
+- `tests/config-store.test.ts`：三键默认值、round-trip、字符串/负数/真值串被拒、手改 `config.json` 的坏值被丢弃回落默认（现共 26 例）。
+- `tests/merge-window.test.ts`：两处「在途批次」用例的 spy 从 `forwardToAgent(user, msg)` 改为 `forwardBlocksToAgent(user, blocks)`，断言的行为不变。
+
+## [0.12.0] - 2026-10-19
+
+### Compatibility
+
+- **DSH 0.2.1-rc.2 adaptation.** The enforced host range is now `>=0.2.1-0 <0.3.0` in both `engines.dsh` and the `@deepseek-ai/dsh` peer; 0.2.1-rc.2 is explicitly in the admission matrix. The 0.2.0 line is no longer claimed. No runtime API change was required: `dsh-wechat@0.11.0` passes a real rc.2 host smoke (HTTP 200 + boot marker).
+
+### Changed
+
+- **设置页改为分组折叠，默认全部收起。** 此前是**一张卡片平铺 15 个控件**：8 个裸键名输入框（`cwd` / `cardTimeoutMs` / `sendWechatRateLimitPerMinute` / `allowedUsers` / `mergeSilenceMs` / `mergeMaxMsgs` / `mergeForcedReleaseMs` / `maxOutgoingFileBytes`）、8 个复选框、提示词正文和两个登录按钮挤在同一列，608px 宽的内容区要滚 995px，而**同一个功能的控件被拆散在不同块里**——「打字合并」开关在复选框区，「静默窗口 / 条数上限 / 强制放行」却在上面几行的网格中，中间还隔着 `maxOutgoingFileBytes`。
+  - 现按用途分为 5 组：**连接与默认行为**（`cwd` / `cardTimeoutMs` / `sendWechatRateLimitPerMinute` / `allowedUsers`）、**消息推送**（决策推送 / 任务提醒 / 静默 / 结论模式）、**打字合并**（总开关 + 三个窗口参数 + 后缀开关）、**微信渠道提示词**（开关 + 正文）、**安全边界**（两个放宽开关 + 外发文件上限）。「已知限制」告警盒同样可折叠。
+  - 收起时标题行右侧显示**由当前配置实时算出**的摘要（如「已关闭 · 每条消息各自一轮」「静默 开 · 结论 关 · 决策推送 开 · 任务提醒 开」），而不是静态文案——折叠不能以看不见配置为代价。
+  - 字段标签从裸键名改为中文名 + 键名小字（`工作目录 cwd`），帮助气泡文案原样保留。
+  - **打字合并总开关关闭时，其三个窗口参数与后缀开关置灰**（`disabled`）并提示「开启后这些参数才生效」；值仍随保存提交，因此关掉再开不会丢调好的窗口。
+  - `重新扫码` / `退出登录` 移到状态区（登录动作属于状态），底部行只留 `保存配置`，并新增 `● 有未保存的修改` 标记——它比对的是 `payloadOf(form)` 与上次保存成功的快照，因此只改空格或改回原值不会被误报。
+  - 展开状态记在浏览器 `localStorage`（键 `dsh-wechat/settings-open`），不进 `config.json`；`localStorage` 不可用（隐私模式 / 配额）时退化为「能展开但不记忆」，不抛错。
+  - 无新配置键、无 API 变更、无保存语义变更：仍然一次 POST 全量 payload。
+
 ### Added
 
 - **`scripts/ci-local.sh` + README 开发须知：Windows 上"全绿"不等于 CI 绿。** CI 是 `ubuntu-latest`，而 PR #11 里一条断言把 Windows 形状的字面量 `C:\home\.dsh` 同时当输入和期望前缀——实现会先对该根目录做 `path.resolve`，在 POSIX 上它是**相对路径**、会解析到 cwd 之下，于是 `startsWith("C:\home\.dsh/sessions")` 恒为 false：本地必绿、CI 必红（该 PR 恰好从未跑过 CI，直到下一次推送才暴露，并因此让 `ci-green` 门禁拦住了 0.11.0 的发布）。脚本在与 CI 完全一致的环境里（复制到本机临时目录后 `npm ci && tsc --noEmit && vitest run`）复现整个流程，且不会用 Linux 版 esbuild/rollup 覆盖工作副本的 `node_modules`。
 
-- **打字合并 / inbound merge window（`mergeEnabled`，⚠️ 默认开启 = 默认行为变更）** —— 此前每条微信消息都是一次独立 turn，一句话分五段发就要烧掉五轮。现在同一聊天的裸文本进入缓冲区，静默窗口（`mergeSilenceMs`，默认 3000ms）到点或条数上限（`mergeMaxMsgs`，默认 10）到达时**合并成一条 prompt** 投递。安全规则是这次实现的重点，因为它们决定了这个功能是「省轮次」还是「卡住通道」：
+- **测试临时目录回收（`tests/temp-cleanup.setup.ts`，vitest `globalSetup`）** —— `mkdtempSync` **只创建、从不删除**，而 33 个使用它的测试文件里只有 10 个记得 `rmSync`，其余 23 个（`session-mgmt` 9 处、`cross-session-notify` 8 处，`corrupt-session` / `final-only` / `frames` / `history-truncation` / `preset-display` 各 2 处，另 16 个文件各 1 处）每次运行都往外漏——单次 `npm test` 实测产生 **364 个**孤儿目录。长期反复跑测试的后果是可量化的：截至本次修复，本机 OS 临时目录里已堆积 **21294 个**此类残留（`dsh-wx-sess` 2304、`dsh-wx-cross` 2266、`dsh-wx-frame` 2143、`dsh-wx-type` 1415 居前），其中 10-12 / 10-13 两天占 82.6%，正对应 0.10.0 / 0.11.0 的密集开发。
+  - 清理放在 `globalSetup` 而非逐个测试文件补 `finally`：后者改动面大，且**以后新增的测试仍会漏**；前者一次性收口，对现有与将来的用例都生效。
+  - 两条安全约束，缺一不可：**① 只删「本次新增」的条目**——`setup` 先对临时目录做快照，`teardown` 只删除快照之外的，因此并发运行的另一个测试进程正在用的目录不会被误删；**② 只删前缀白名单内的条目**（`dsh-wx-` / `dsh-home-` / `dsh-wechat-` / `wx-process-` / `send-wechat-`）——宿主自身的 `dsh-spill-*`、`dsh-subprocess-*`、`dsh-workspace-changes-*`、`dsh-acl-*`、`dsh-mcp-probe-cwd` 不匹配任何前缀，**永不被触碰**，所以「一边跑测试、一边有 DSH 会话在跑」不会互相破坏。`setup` 未执行时 `teardown` 直接返回（`preexisting` 为 `null`），避免任何「快照缺失 ⇒ 全删」的退化路径。
+  - 该残留**不涉及凭据泄漏**：抽查 `dsh-wx-relogin-*/auth/token.json` 内容为 `{"token":"t","baseUrl":"https://gw","accountId":"b1","userId":"u"}`，是测试夹具而非真实微信凭据。占用亦极小（21294 个目录合计仅 6.47 MB，多数为空目录或数百字节的 `state.json`）——**真正的问题是条目数量**，而非体积。
+
+- **打字合并 / inbound merge window（`mergeEnabled`，默认关闭 = 需显式开启）** —— 此前每条微信消息都是一次独立 turn，一句话分五段发就要烧掉五轮。开启后同一聊天的裸文本进入缓冲区，静默窗口（`mergeSilenceMs`，默认 3000ms）到点或条数上限（`mergeMaxMsgs`，默认 10）到达时**合并成一条 prompt** 投递。**默认关闭**：合并改变「一轮」的含义（一轮里可能有多条用户消息），且每条消息要多等一个静默窗口，对「把 x 改成 y」这类短指令是净损失，因此按 opt-in 处理——升级后行为与旧版完全一致，需要时用 `/merge on` 或设置页开启。安全规则是这次实现的重点，因为它们决定了这个功能是「省轮次」还是「卡住通道」：
   - **乱序的旧消息不延长计时器**——消息自带的 `create_time_ms` 早于已缓冲的最新时间戳时只追加、不重置静默窗口，否则一条迟到重放就能把批次一直挂住；更新的消息才会顺延。
   - **条数硬上限**（默认 10）作为防御性边界，缓冲区永远不会超过它。
   - **强制放行**（`mergeForcedReleaseMs`，默认 180000 = 3 分钟）：无论静默窗口、`..` 暂挂、还是上一批仍在投递，到点一定发出并记日志——「宁可两句话一轮，也不让通道卡死」。
@@ -107,6 +231,14 @@
 - **出站串行槽既不会报错也不会超时（R1）** —— `serializeOutbound` 没有重入断言、也没有上界：锁内再调用公共入口会把该操作排到**自己**后面，永久卡死整条出站链路（这一类缺陷已经真实发生过一次，且是致命的）。现在：① 用 `AsyncLocalStorage` **精确**识别「同一条调用链内重入」（只是恰好同时到达的并发调用仍属正常排队，不会被误判），命中即**立刻抛错并记日志**，修复方式唯一——改调 `*Locked` 版本；② 等待上一个操作**有上界**（30s），超时记日志后照常发出，牺牲极端情况下的严格顺序换取活性。空闲路径仍然零定时器、零额外跳转。
 - **四个只涨不降的内存表（R2）** —— `lastAssistantTextBySession`（存整条助手正文，上限 64 会话）、`lastActivityBySession`（上限 512 会话）、`wechatMessageIds`（一次性标记，10 分钟 TTL **加** 512 条硬上限；此前只有 echo 到达才会删，echo 永不到达就永久驻留）、`modelOverrides`（上限 128 会话）现在都有确定性淘汰（插入序 FIFO，淘汰即记日志）。它们都是**缓存**：淘汰只会让显示退回默认值，不会丢队列里的任何消息。
 - **重启静默丢弃排队出站（R3）** —— 运行时队列硬上限是 400 条，而 `state.json` 重新加载只保留最后 100 条：一次重启就会**静默丢掉第 101–400 条**（正好是通知、结论、工具推送这些最不该丢的内容）。加载上限现与运行时硬上限对齐（400），重启完整恢复持久化的有界集合。
+
+### Tests
+
+- 新增 `tests/merge-window.test.ts`（24 例）：窗口内五条消息合成**一条** prompt 且顺序不乱、批次投递后缓冲区确实排空（不留只写不读的状态）、`..` / `!!` 后缀语义与「整条消息只有后缀」的退化情形、强制放行在 `..` 暂挂期间仍会发出、非文本项不参与合并、`/merge` 与 `/silent` 同款接线（解析矩阵、`/help`、bypass、持久化、`LOCAL_COMMAND_NAMES` 去重）。
+- 新增 `tests/security-hardening.test.ts`（27 例）：S1 提权闸门的放行/拒绝矩阵（含自定义只降审批的预设）、S2 `send_wechat` 的 `..` 与符号链接逃逸、按**调用会话**而非收件人求值、`stat` 阶段拒超大文件、S3 播种三条分支（升级播种 / 全新安装不播种 / 显式 `[]` 永不覆盖）、S4 目录与文件的 `0700`/`0600`、入站日志无原始 id 无正文、审计 sink 的轮转与「写失败不影响消息路径」。
+- 新增 `tests/delivery-hardening.test.ts`（12 例）：S5 卡片先确认可达再占用一次性标记、投递抛错时回滚、R1 串行槽的重入立即抛错与 30s 等待上界、R2 四张缓存表的淘汰、R3 重启恢复 150 条而不是截到 100 条。
+- `tests/client-panel-wiring.test.ts` 增加「settings panel grouping」分组（现共 57 例）：五个分组的 id 必须同时出现在 `Group({id})` 与 CSS 里、**打字合并的开关与其全部参数必须落在同一个分组切片内**（断言参数控件不出现在 `id: "merge"` 之前）、总开关关闭时四个输入确实 `disabled`、`localStorage` 键与降级路径、未保存标记比对的是 `payloadOf(form)`、以及「面板渲染的每个 `wx_*` 类名都在样式表里有规则」。
+- `tests/host-line.test.ts` 扩到 29 例：准入矩阵改为 `0.2.1-0` 起（`0.2.0` 线不再被声称）、rc.2 目标必须被接受，并新增三条 `PUBLISH.md` 文档回归——正文引用的区间必须与 `package.json` 逐字相同、必须继续提醒 peer 要标 `optional`、必须继续写明上界要带 `-0`。
 
 ## [0.11.0] - 2026-10-13
 
